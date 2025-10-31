@@ -10,9 +10,11 @@ Test recordings and validation data. Organized by test session:
 - `test_runs/002_XXXX/` - Future test sessions
 
 ### `production/`
-Real deployment recordings from ocean sessions. Organized by date:
-- `2025-XX-XX_session_001/` - 10-hour production sessions
+Real deployment recordings from ocean sessions (~10-hour logging sessions). Organized by date:
+- `2025-XX-XX_session_001/` - ~10-hour production sessions
 - `2025-XX-XX_session_002/` - etc.
+
+Each production session targets approximately 10 hours of continuous recording at 200 Hz, requiring ~2.9 GB storage per session (raw binary).
 
 ### `decoded/`
 Decoded/converted output files (CSV, JSON, etc.)
