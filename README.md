@@ -59,7 +59,29 @@ This project aims to build a minimalist offline logger that captures IMU data (B
 ### Decoding a Recording
 
 ```bash
+# From project root
 python scripts/decoder/sea-movement_decoder.py recordings/test/test_runs/001_on\ desk/bno_009.bin
+
+# Or with relative path
+cd scripts/decoder
+python sea-movement_decoder.py ../../recordings/test/test_runs/001_on\ desk/bno_009.bin
+```
+
+### Git Workflow
+
+```bash
+# View current status
+git status
+
+# View active tasks
+cat TODO.txt
+
+# Commit changes
+git add <files>
+git commit -m "Description of changes"
+
+# Push to GitHub (after setting up remote)
+git push origin main
 ```
 
 ### Script Versions
