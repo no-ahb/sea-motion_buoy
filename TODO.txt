@@ -1,0 +1,52 @@
+# TODO: Ocean Motion Sensing Buoy
+
+This file tracks active tasks, feature requests, and improvements. Multiple agents may update this file.
+
+Last updated: [Auto-updated by agents]
+
+## Active Tasks
+
+### Script Iterations
+- [ ] Review and optimize recorder script for power consumption
+- [ ] Enhance decoder to output CSV/JSON formats
+- [ ] Add data validation checks to decoder (verify quaternion normalization, etc.)
+- [ ] Implement error detection and recovery in recorder
+
+### Data Management
+- [ ] Create script to batch-decode recordings
+- [ ] Add metadata extraction (recording duration, sample count, stats)
+- [ ] Develop data visualization tools (basic plots)
+
+### Testing
+- [ ] Validate decoder output matches expected format
+- [ ] Test recorder across multiple deployment scenarios
+- [ ] Verify data integrity for extended recordings
+
+### Documentation
+- [ ] Document power consumption measurements
+- [ ] Create deployment guide
+- [ ] Document calibration procedures
+
+### Hardware
+- [ ] Finalize flotation design
+- [ ] Document waterproofing approach
+- [ ] Create assembly instructions
+
+## Feature Suggestions
+
+### Short-term
+- Add recording metadata (device ID, session notes) to file header
+- Implement automatic file rotation based on size/duration
+- Add LED status codes for different states
+- Create data validation summary report
+
+### Long-term
+- Real-time data streaming option (via serial/USB)
+- Multi-device synchronization support
+- Automated data quality scoring
+- Integration with wave analysis tools
+
+## Notes
+
+[Agents should add notes here when making changes or encountering issues]
+
