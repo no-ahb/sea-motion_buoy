@@ -39,11 +39,11 @@ A minimal open-hardware buoy system for capturing and reproducing 3-axis ocean-s
 
 ---
 
-### 2. Integrate Recent Firmware Fixes
-* Implement **double-buffered SD writing** to achieve stable 100–200 Hz sampling.
-* Record **actual effective sample rate** at session end.
-* Keep pre-allocated 18 KB block buffer + `pack_into` structure.
-* Remove per-loop `flush()` calls; flush only at stop or every N blocks.
+### 2. Integrate Recent Firmware Fixes ✅
+* ✅ Implement **double-buffered SD writing** to achieve stable 100–200 Hz sampling.
+* ✅ Record **actual effective sample rate** at session end (written to `_meta.txt` sidecar file).
+* ✅ Keep pre-allocated 18 KB block buffer + `pack_into` structure.
+* ✅ Remove per-loop `flush()` calls; flush only at stop or every N blocks (configurable `FLUSH_EVERY_N`).
 
 ### 3. Enhance Desktop Decoder 
 * Parse header → compute true sample rate → CSV export.
@@ -62,11 +62,11 @@ A minimal open-hardware buoy system for capturing and reproducing 3-axis ocean-s
 
 ### Firmware
 
-* [ ] Integrate double-buffer + block write system for stable 100–200 Hz logging.
-* [ ] Add “effective sample rate” metadata to log or sidecar file.
+* [x] Integrate double-buffer + block write system for stable 100–200 Hz logging.
+* [x] Add "effective sample rate" metadata to log or sidecar file.
 * [ ] Add optional CRC per block for data integrity.
 * [ ] Optimize power (reduce SD writes, limit LED use during idle).
-* [ ] Retain LED/button FSM (bias → ready → recording → stop).
+* [x] Retain LED/button FSM (bias → ready → recording → stop).
 
 ### Decoder & Processing
 * [ ] Extend decoder to export CSV / NumPy formats.
