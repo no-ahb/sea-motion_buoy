@@ -1,6 +1,17 @@
 import struct
+import sys
+import os
 
-filename = "bno_009.bin"
+# Accept filename as command-line argument or use default
+if len(sys.argv) > 1:
+    filename = sys.argv[1]
+else:
+    # Default to a test file if no argument provided
+    filename = "../recordings/test/test_runs/001_on desk/bno_009.bin"
+    if not os.path.exists(filename):
+        print(f"Usage: {sys.argv[0]} <path_to_bin_file>")
+        print(f"Example: {sys.argv[0]} ../recordings/test/test_runs/001_on\\ desk/bno_009.bin")
+        sys.exit(1)
 
 # Header: magic(4) ver(1) rate(2) reserved(1) = 8 bytes
 header_size = 8
