@@ -24,7 +24,7 @@ This project implements a minimalist offline logger that captures IMU data (BNO0
 ├── MATERIALS.md              # Bill of materials
 ├── scripts/                  # Code files
 │   ├── recorder/             # Recorder scripts (MicroPython)
-│   │   ├── sea-movement-recorder_script.py
+│   │   ├── sea-movement_recorder.py
 │   │   └── bno085_test.py
 │   ├── decoder/              # Decoder scripts (Python 3)
 │   │   └── sea-movement_decoder.py
@@ -41,15 +41,6 @@ This project implements a minimalist offline logger that captures IMU data (BNO0
 │   └── datasheets/           # Component datasheets
 └── archive/                  # Old/retired script versions
 ```
-
-## Firmware Features
-
-- 200 Hz acquisition (linear accel + quaternion) - *target rate, currently 100 Hz*
-- 20 s still-bias calibration on boot - *currently 4 s*
-- Binary logging in 512-record blocks (~18 KB per flush)
-- LED + button control with safe unmount
-- Power-safe block flushing and optional CRC (planned)
-- Double-buffered SD writing for stable 100–200 Hz sampling (planned)
 
 ## Data Format
 
@@ -89,23 +80,6 @@ cd scripts/decoder
 python sea-movement_decoder.py ../../recordings/test/test_runs/001_on\ desk/bno_009.bin
 ```
 
-### Git Workflow
-
-```bash
-# View current status
-git status
-
-# View active tasks
-cat TODO.txt
-
-# Commit changes
-git add <files>
-git commit -m "Description of changes"
-
-# Push to GitHub (after setting up remote)
-git push origin main
-```
-
 ### Script Versions
 
 See `CHANGELOG.md` for version history and `TODO.txt` for active development tasks.
@@ -138,8 +112,3 @@ See `MATERIALS.md` for the complete bill of materials.
 - 🔄 Testing data format validation
 - 📋 Preparing for 10-hour production sessions
 - 📋 Post-processing workflow implementation (quaternion rotation, filtering, integration)
-
-## License
-
-[Add license here if needed]
-
