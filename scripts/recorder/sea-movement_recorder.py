@@ -5,7 +5,7 @@ import uos, struct, sdcard
 from bno08x import *
 
 # -------- CONFIG --------
-RATE_HZ     = 100
+RATE_HZ     = 200
 BIAS_RATE   = 25
 BIAS_SECS   = 4
 BLOCK_RECS  = 512              # ~18 KB per flush
