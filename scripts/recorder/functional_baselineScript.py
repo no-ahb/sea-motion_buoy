@@ -5,21 +5,20 @@ import uos, struct, sdcard
 from bno08x import *
 
 # -------- CONFIG --------
-RATE_HZ     = 200
+RATE_HZ     = 100
 BIAS_RATE   = 25
 BIAS_SECS   = 4
-BLOCK_RECS  = 512              # 16 KB per flush (512 * 32 bytes)
-FLUSH_EVERY_N = 10            # Flush every N blocks (0 = only at stop)
+BLOCK_RECS  = 512              # ~18 KB per flush
 I2C_FREQ    = 400_000
 SPI_BAUD    = 12_000_000
 CS_PIN      = 13
-LED_PIN     = 16               # external LED (active-high)
+LED_PIN     = 28              	# external LED (active-high)
 BTN_PIN     = 14               # button to GND (active-low)
 STATUS_MS   = 2000
 # ------------------------
 
 DT_MS    = int(1000 // RATE_HZ)
-REC_FMT  = "<Ifffffff"         # [t_ms][lx ly lz qi qj qk qr] = 32 bytes/rec
+REC_FMT  = "<Ifffffff"         # [t_ms][lx ly lz qi qj qk qr]
 REC_SIZE = struct.calcsize(REC_FMT)
 
 # States
@@ -203,139 +202,71 @@ def enable_logging_features():
     bno.enable_feature(BNO_REPORT_GAME_ROTATION_VECTOR, RATE_HZ)
     bno.set_quaternion_euler_vector(BNO_REPORT_GAME_ROTATION_VECTOR)
 
-# --- Recording loop (double-buffered + pack_into) ---
+# --- Recording loop (preallocated buffer + pack_into) ---
 def record_session(bias_xyz, fname):
-    """Record session with robust error handling."""
     bx, by, bz = bias_xyz
-    f = None
+    f = open(fname, "wb")
+    # header: magic(4) ver(1) rate(2) reserved(1)
+    f.write(struct.pack("<IBHB", 0x424E4F31, 1, RATE_HZ, 0))  # "BNO1"
+
+    buf  = bytearray(REC_SIZE * BLOCK_RECS)
+    pack_into = struct.pack_into
     widx = 0
     total = 0
-    blocks_written = 0
-    t_first_sample = None
-    t_last_sample = None
-    
-    try:
-        f = open(fname, "wb")
-        # header: magic(4) ver(1) rate(2) reserved(1)
-        f.write(struct.pack("<IBHB", 0x424E4F31, 1, RATE_HZ, 0))  # "BNO1"
+    t0 = ticks_ms()
+    t_last = t0
 
-        # Double-buffered: two pre-allocated buffers
-        buf_a = bytearray(REC_SIZE * BLOCK_RECS)
-        buf_b = bytearray(REC_SIZE * BLOCK_RECS)
-        active_buf = buf_a
-        write_buf = None
-        pack_into = struct.pack_into
-        
-        t0 = ticks_ms()
-        t_last = t0
+    print("Recording ->", fname, "| rate =", RATE_HZ, "Hz")
+    while True:
+        now = ticks_ms()
+        # Solid LED during recording
+        led.value(1)
 
-        print("Recording ->", fname, "| rate =", RATE_HZ, "Hz")
-        while True:
-            now = ticks_ms()
-            # Solid LED during recording
-            led.value(1)
-
-            # stop on button press (debounced)
+        # stop on button press (debounced)
+        if btn_pressed():
+            sleep_ms(40)
             if btn_pressed():
-                sleep_ms(40)
-                if btn_pressed():
-                    break
+                break
 
-            # Track sample times for effective rate calculation
-            if t_first_sample is None:
-                t_first_sample = now
-            t_last_sample = now
+        t_ms = ticks_diff(now, t0)
+        ax, ay, az = bno.acc
+        gx, gy, gz = bno.gravity
+        lx, ly, lz = ax - gx - bx, ay - gy - by, az - gz - bz
+        qi, qj, qk, qr = bno.quaternion
 
-            t_ms = ticks_diff(now, t0)
-            ax, ay, az = bno.acc
-            gx, gy, gz = bno.gravity
-            lx, ly, lz = ax - gx - bx, ay - gy - by, az - gz - bz
-            qi, qj, qk, qr = bno.quaternion
+        pack_into(REC_FMT, buf, widx * REC_SIZE, t_ms, lx, ly, lz, qi, qj, qk, qr)
+        widx += 1; total += 1
 
-            pack_into(REC_FMT, active_buf, widx * REC_SIZE, t_ms, lx, ly, lz, qi, qj, qk, qr)
-            widx += 1; total += 1
+        if widx == BLOCK_RECS:
+            t_w0 = ticks_ms()
+            f.write(buf); f.flush()
+            # brief flush flicker
+            led.value(0); sleep_ms(40); led.value(1)
+            print("[FLUSH] samples=%d wrote=%d bytes in %d ms" %
+                  (total, len(buf), ticks_diff(ticks_ms(), t_w0)))
+            widx = 0
+            gc_collect()
 
-            if widx == BLOCK_RECS:
-                # Switch buffers: active -> write, alternate -> active
-                write_buf = active_buf
-                active_buf = buf_b if active_buf is buf_a else buf_a
-                widx = 0
-                
-                # Write the filled buffer (non-blocking if double-buffered)
-                t_w0 = ticks_ms()
-                f.write(write_buf)
-                # No flush here - only flush periodically or at stop
-                blocks_written += 1
-                
-                # Periodic flush if configured
-                if FLUSH_EVERY_N > 0 and (blocks_written % FLUSH_EVERY_N == 0):
-                    f.flush()
-                    print("[FLUSH] blocks=%d samples=%d (flushed)" % (blocks_written, total))
-                else:
-                    print("[BLOCK] blocks=%d samples=%d wrote=%d bytes in %d ms" %
-                          (blocks_written, total, len(write_buf), ticks_diff(ticks_ms(), t_w0)))
-                
-                # Brief LED flicker on block write
-                led.value(0); sleep_ms(10); led.value(1)
-                gc_collect()
+        if ticks_diff(now, t_last) >= STATUS_MS:
+            print("[STAT] t=%.1fs count=%d (lx,ly,lz)=(%.3f,%.3f,%.3f)" %
+                  (ticks_diff(now, t0)/1000, total, lx, ly, lz))
+            t_last = now
 
-            # Status prints commented out for max rate stability
-            # if ticks_diff(now, t_last) >= STATUS_MS:
-            #     print("[STAT] t=%.1fs count=%d (lx,ly,lz)=(%.3f,%.3f,%.3f)" %
-            #           (ticks_diff(now, t0)/1000, total, lx, ly, lz))
-            #     t_last = now
+        # pace
+        elapsed = ticks_diff(ticks_ms(), now)
+        rem = DT_MS - elapsed
+        if rem > 0:
+            sleep_ms(rem)
+        if (total & 511) == 0:
+            gc_collect()
 
-            # pace
-            elapsed = ticks_diff(ticks_ms(), now)
-            rem = DT_MS - elapsed
-            if rem > 0:
-                sleep_ms(rem)
-            if (total & 511) == 0:
-                gc_collect()
-    
-    except KeyboardInterrupt:
-        print("Recording interrupted by user")
-        raise
-    except Exception as e:
-        print(f"Error during recording: {e}")
-        raise
-    finally:
-        # Robust close: ensure file is written and closed
-        if f is not None:
-            try:
-                # Write remaining partial block
-                if widx > 0:
-                    f.write(memoryview(active_buf)[:widx*REC_SIZE])
-                    blocks_written += 1
-                
-                # Final flush and close
-                f.flush()
-                f.close()
-                print("File safely closed:", fname)
-            except Exception as e:
-                print(f"Warning: Error closing file: {e}")
-        
-        # Calculate and write effective sample rate to sidecar file
-        if t_first_sample and t_last_sample:
-            duration_ms = ticks_diff(t_last_sample, t_first_sample)
-            effective_rate = (total * 1000.0 / duration_ms) if duration_ms > 0 else 0.0
-            
-            # Write metadata to sidecar file
-            meta_fname = fname.replace(".bin", "_meta.txt")
-            try:
-                with open(meta_fname, "w") as mf:
-                    mf.write("Recording: %s\n" % fname)
-                    mf.write("Target rate: %d Hz\n" % RATE_HZ)
-                    mf.write("Effective rate: %.2f Hz\n" % effective_rate)
-                    mf.write("Total samples: %d\n" % total)
-                    mf.write("Duration: %.2f s (%.2f min)\n" % (duration_ms/1000.0, duration_ms/60000.0))
-                    mf.write("Blocks written: %d\n" % blocks_written)
-                    mf.write("Block size: %d records (%d bytes)\n" % (BLOCK_RECS, REC_SIZE * BLOCK_RECS))
-                print("Effective sample rate: %.2f Hz (target: %d Hz)" % (effective_rate, RATE_HZ))
-                print("Metadata saved to:", meta_fname)
-            except Exception as e:
-                print("Warning: Could not write metadata:", e)
-    
+    # graceful close
+    if widx:
+        f.write(memoryview(buf)[:widx*REC_SIZE])
+    try:
+        f.flush(); f.close()
+    except:
+        pass
     print("Recording stopped. File closed:", fname)
 
 # -------- MAIN FSM --------
@@ -375,6 +306,7 @@ try:
                 break
             else:
                 print(f"I2C scan attempt {attempt+1} found no devices, retrying...")
+                # Blink for retry
                 led.value(0)
                 sleep_ms(100)
                 led.value(1)
@@ -531,3 +463,4 @@ except Exception as e:
     while True:
         led.value(1 if blink_pattern(ticks_ms(), state) else 0)
         sleep_ms(20)
+

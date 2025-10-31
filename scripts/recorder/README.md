@@ -4,21 +4,22 @@ MicroPython scripts for the Raspberry Pi Pico 2 to capture 9-DoF IMU data for oc
 
 ## Files
 
-- `sea-movement-recorder_script.py` - Main recorder script
+- `functional_baselineScript.py` - Main recorder script with battery monitoring (rename to `main.py` on device for auto-run)
+- `sea-movement_recorder.py` - Alternative recorder script
 - `bno085_test.py` - Test/development script for BNO085 sensor
 
 ## Upload to Pico
 
-1. Copy files to Pico (via Thonny or similar)
-2. Copy `bno08x.py` library to Pico:
-   - From: `scripts/library/BOSCH-BNO085-I2C-micropython-library/lib/bno08x.py`
-   - To: Pico root directory
-3. Ensure MicroSD card is mounted and accessible
-4. Run `sea-movement-recorder_script.py` on the Pico
+1. Copy files to Pico (via Thonny or similar):
+   - `functional_baselineScript.py` → Rename to `main.py` on Pico (for auto-run on battery)
+   - `bno08x.py` library → Pico root directory:
+     - From: `scripts/library/BOSCH-BNO085-I2C-micropython-library/lib/bno08x.py`
+2. Ensure MicroSD card is mounted and accessible
+3. The `main.py` file will automatically execute on boot when powered by battery
 
 ## Configuration
 
-Edit these constants in `sea-movement-recorder_script.py`:
+Edit these constants in `functional_baselineScript.py` (before uploading as `main.py`):
 - `RATE_HZ` - Sampling rate (default: 100 Hz; target: 200 Hz)
 - `BIAS_SECS` - Still-bias calibration duration (default: 4s; target: 20s)
 - `BIAS_RATE` - Calibration sample rate (default: 25 Hz)
