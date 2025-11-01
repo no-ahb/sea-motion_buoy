@@ -16,6 +16,7 @@ SPI_BAUD      = 12_000_000
 CS_PIN        = 13
 LED_PIN       = 28
 BTN_PIN       = 14
+INT_PIN       = 2
 STATUS_MS     = 2000
 # ------------------------
 
@@ -39,6 +40,7 @@ def print_battery_status():
 # --- LED / Button (IRQ-latched stop) ---
 led = Pin(LED_PIN, Pin.OUT, value=0)
 btn = Pin(BTN_PIN, Pin.IN, Pin.PULL_UP)
+int_pin = Pin(INT_PIN, Pin.IN, Pin.PULL_UP) if INT_PIN is not None else None
 
 stop_flag=False; _last_ms=0
 def _btn_irq(p):
@@ -47,6 +49,13 @@ def _btn_irq(p):
     if p.value()==0 and ticks_diff(now,_last_ms)>200:
         stop_flag=True; _last_ms=now
 btn.irq(trigger=Pin.IRQ_FALLING, handler=_btn_irq)
+
+data_ready_flag = False
+if int_pin is not None:
+    def _int_irq(p):
+        global data_ready_flag
+        data_ready_flag = True
+    int_pin.irq(trigger=Pin.IRQ_FALLING, handler=_int_irq)
 
 def blink_pattern(now,state):
     S_BOOT,S_READY,S_REC,S_STOP,S_ERR=0,1,2,3,4
@@ -101,8 +110,9 @@ def enable_logging_features():
 
 # --- Recording (reads ONLY 2 reports per sample) ---
 def record_session(bias_xyz, fname):
-    global stop_flag
+    global stop_flag, data_ready_flag
     stop_flag=False
+    data_ready_flag=False
     bx,by,bz=bias_xyz
 
     f=open(fname,"wb")
@@ -117,25 +127,44 @@ def record_session(bias_xyz, fname):
     led.value(1)
 
     try:
-        # Preallocate buffers for zero-alloc combined reads
-        acc3 = array('f', [0.0, 0.0, 0.0])
-        quat4 = array('f', [0.0, 0.0, 0.0, 0.0])
+        # Prefer zero-alloc combined reads when the driver supports it
+        combined_read = getattr(bno, "read_combined_into", None)
+        if combined_read:
+            acc3 = array('f', [0.0, 0.0, 0.0])
+            quat4 = array('f', [0.0, 0.0, 0.0, 0.0])
+        else:
+            acc3 = quat4 = None
         # Fixed-deadline scheduler: do not rebase to 'now' each loop
         next_t = ticks_add(ticks_ms(), DT_MS)
         while True:
             if stop_flag:
                 print("Stop requested."); break
 
+            # Wait for sensor data-ready interrupt (with timeout fallback)
+            if int_pin is not None:
+                if not data_ready_flag:
+                    wait_start = ticks_ms()
+                    while (not data_ready_flag) and (not stop_flag):
+                        if ticks_diff(ticks_ms(), wait_start) > (DT_MS * 2):
+                            break
+                        sleep_ms(0)
+                data_ready_flag = False
+
             now=ticks_ms()
             if t_first is None: t_first=now
             t_last_s=now
             t_ms=ticks_diff(now,t0)
 
-            # Combined drain of FIFO and zero-alloc copy into preallocated arrays
-            bno.read_combined_into(acc3, quat4)
-            # subtract the small still-bias (helps DC offsets)
-            lx = acc3[0] - bx; ly = acc3[1] - by; lz = acc3[2] - bz
-            qi, qj, qk, qr = quat4
+            if combined_read:
+                # Combined drain of FIFO and zero-alloc copy into preallocated arrays
+                combined_read(acc3, quat4)
+                lx = acc3[0] - bx; ly = acc3[1] - by; lz = acc3[2] - bz
+                qi, qj, qk, qr = quat4
+            else:
+                # Fallback for older driver builds without read_combined_into
+                lx, ly, lz = bno.acc_linear
+                lx -= bx; ly -= by; lz -= bz
+                qi, qj, qk, qr = bno.quaternion
 
             pack_into(REC_FMT, active, widx*REC_SIZE, t_ms, lx,ly,lz, qi,qj,qk,qr)
             widx+=1; total+=1
