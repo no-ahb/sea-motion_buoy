@@ -54,4 +54,3 @@ Edit these constants in `functional_baselineScript.py` (before uploading as `mai
 - **Remove per-loop flush()** calls; flush only at stop or every N blocks
 - **Optional CRC per block** for data integrity
 - **Power optimization** (reduce SD writes, limit LED use during idle)
-

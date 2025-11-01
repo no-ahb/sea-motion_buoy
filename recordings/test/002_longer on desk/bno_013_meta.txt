@@ -1,0 +1,7 @@
+Recording: /sd/bno_013.bin
+Target rate: 100 Hz
+Effective rate: 75.38 Hz
+Total samples: 243373
+Duration: 3228.52 s
+Blocks: 238
+Block size: 1024 records (32768 bytes)

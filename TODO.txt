@@ -7,8 +7,7 @@
 
 ## To Do Now (go through this, erase any tasks completed, add them to the changelog, update "last updated" with brief memo of tasks completed, renumber or edit remaining tasks )
 1. check calibration on boot, should it be changed?
-2. what is this: Power-safe block flushing and optional CRC (planned)
-3. u
+2. 
 
 
 ---

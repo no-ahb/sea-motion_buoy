@@ -5,133 +5,78 @@ import uos, struct, sdcard
 from bno08x import *
 
 # -------- CONFIG --------
-RATE_HZ     = 200
-BIAS_RATE   = 25
-BIAS_SECS   = 4
-BLOCK_RECS  = 512              # 16 KB per flush (512 * 32 bytes)
-FLUSH_EVERY_N = 10            # Flush every N blocks (0 = only at stop)
-I2C_FREQ    = 400_000
-SPI_BAUD    = 12_000_000
-CS_PIN      = 13
-LED_PIN     = 16               # external LED (active-high)
-BTN_PIN     = 14               # button to GND (active-low)
-STATUS_MS   = 2000
+RATE_HZ       = 200
+BIAS_RATE     = 25
+BIAS_SECS     = 10
+BLOCK_RECS    = 512                # 512 * 32B = 16 KiB blocks
+FLUSH_EVERY_N = 1                  # flush every block (debug visibility)
+I2C_FREQ      = 400_000
+SPI_BAUD      = 12_000_000
+CS_PIN        = 13
+LED_PIN       = 28                 # use GP16 for LED (safe choice)
+BTN_PIN       = 14                 # button to GND (internal pull-up)
+STATUS_MS     = 2000
 # ------------------------
 
 DT_MS    = int(1000 // RATE_HZ)
-REC_FMT  = "<Ifffffff"         # [t_ms][lx ly lz qi qj qk qr] = 32 bytes/rec
+REC_FMT  = "<Ifffffff"             # [t_ms][lx ly lz qi qj qk qr] = 32 B
 REC_SIZE = struct.calcsize(REC_FMT)
 
 # States
 S_BOOT, S_READY, S_REC, S_STOPPING, S_ERR = range(5)
 
-# --- Battery Monitoring (LiPo SHIM) ---
-# VSYS monitoring via ADC29 (internal ÷3 divider)
-# On battery: VSYS ≈ battery voltage
-# On USB: VSYS ≈ 5V (via power-mux diode)
-VBUS_SENSE = Pin(24, Pin.IN)  # USB present signal
-VSYS_ADC = ADC(29)  # ADC3, internal divider: VSYS/3
-VREF = 3.3
-DIV = 3.0  # internal VSYS→ADC ÷3 divider
-
+# --- Power sense (optional; harmless if unused) ---
+VBUS_SENSE = Pin(24, Pin.IN)  # USB present
+VSYS_ADC   = ADC(29)          # VSYS/3
+VREF, DIV  = 3.3, 3.0
 def read_vsys_voltage():
-    """Read VSYS voltage using ADC29 with internal ÷3 divider."""
     try:
         raw = VSYS_ADC.read_u16()
-        # Convert: (raw/65535) * 3.3V * 3 (divider) = VSYS voltage
-        vsys_v = (raw / 65535.0) * VREF * DIV
-        return vsys_v, raw
-    except Exception as e:
+        return (raw / 65535.0) * VREF * DIV, raw
+    except:
         return None, None
 
-def read_battery_status():
-    """Read battery/VSYS status with USB detection."""
-    try:
-        usb_present = bool(VBUS_SENSE.value())
-        vsys_v, adc_raw = read_vsys_voltage()
-        
-        if vsys_v is None:
-            return None
-        
-        if usb_present:
-            # USB is present; VSYS ≈ 5V (not battery voltage)
-            return {
-                "usb": True,
-                "vsys_v": vsys_v,
-                "battery_v": None,
-                "percent": None,
-                "adc_raw": adc_raw
-            }
-        
-        # Battery mode: VSYS ≈ battery voltage
-        # Piecewise LiPo percentage (open-circuit, approximate)
-        # 4.20=100%, 4.00≈85, 3.90≈70, 3.80≈55, 3.70≈40, 3.60≈25, 3.50≈10, 3.40≈5, <3.30 critical
-        edges = [4.20, 4.00, 3.90, 3.80, 3.70, 3.60, 3.50, 3.40, 3.30]
-        perc = [100, 85, 70, 55, 40, 25, 10, 5, 0]
-        percentage = next((perc[i] for i, e in enumerate(edges) if vsys_v >= e), 0)
-        
-        return {
-            "usb": False,
-            "vsys_v": vsys_v,
-            "battery_v": vsys_v,  # On battery, VSYS ≈ battery voltage
-            "percent": percentage,
-            "adc_raw": adc_raw
-        }
-    except Exception as e:
-        return None
-
 def print_battery_status():
-    """Print battery/VSYS status at startup."""
-    status = read_battery_status()
+    vsys_v, adc_raw = read_vsys_voltage()
     print("=" * 40)
-    if status is None:
-        print("Battery Status: Unable to read (check ADC/GPIO)")
-        print("=" * 40)
-        return
-    
-    if status["usb"]:
+    if vsys_v is None:
+        print("Battery Status: Unable to read"); print("=" * 40); return
+    if VBUS_SENSE.value():
         print("Power Status (USB Connected):")
-        print(f"  VSYS: {status['vsys_v']:.2f} V")
-        print(f"  ADC Raw: {status['adc_raw']}")
-        print(f"  Note: Battery voltage not available on USB")
+        print("  VSYS: %.2f V" % vsys_v); print("  ADC Raw:", adc_raw)
+        print("  Note: Battery voltage not available on USB")
     else:
         print("Battery Status (LiPo SHIM):")
-        print(f"  Battery Voltage: {status['battery_v']:.2f} V")
-        print(f"  VSYS: {status['vsys_v']:.2f} V")
-        print(f"  Level: {status['percent']}%")
-        print(f"  ADC Raw: {status['adc_raw']}")
-        # Status indicator
-        if status['percent'] >= 80:
-            status_str = "✓ Good"
-        elif status['percent'] >= 50:
-            status_str = "○ OK"
-        elif status['percent'] >= 20:
-            status_str = "! Low"
-        else:
-            status_str = "⚠ Critical"
-        print(f"  Status: {status_str}")
+        print("  VSYS: %.2f V" % vsys_v); print("  ADC Raw:", adc_raw)
     print("=" * 40)
 
-# --- LED / Button ---
+# --- LED / Button with IRQ-latched stop ---
 led = Pin(LED_PIN, Pin.OUT, value=0)
 btn = Pin(BTN_PIN, Pin.IN, Pin.PULL_UP)
+
+stop_flag = False
+last_press_ms = 0
+def _btn_irq(pin):
+    # latch a stop request on falling edge with simple debounce
+    global stop_flag, last_press_ms
+    now = ticks_ms()
+    if ticks_diff(now, last_press_ms) > 200 and pin.value() == 0:
+        stop_flag = True
+        last_press_ms = now
+
+btn.irq(trigger=Pin.IRQ_FALLING, handler=_btn_irq)
 
 def btn_pressed():
     return btn.value() == 0
 
 def blink_pattern(now_ms, state):
-    if state == S_BOOT:       # slow blink: 200ms ON per 1s
-        return (now_ms % 1000) < 200
-    if state == S_READY:      # double-blink every 2s
-        p = now_ms % 2000
-        return (0 <= p < 120) or (240 <= p < 360)
-    if state == S_REC:        # solid ON (flush flicker handled elsewhere)
-        return True
-    if state == S_STOPPING:   # triple-blink (1s window)
-        p = now_ms % 1000
-        return (0 <= p < 80) or (200 <= p < 280) or (400 <= p < 480)
-    if state == S_ERR:        # fast blink
-        return (now_ms % 200) < 100
+    if state == S_BOOT:    return (now_ms % 1000) < 200
+    if state == S_READY:
+        p = now_ms % 2000; return (0 <= p < 120) or (240 <= p < 360)
+    if state == S_REC:     return True
+    if state == S_STOPPING:
+        p = now_ms % 1000; return (0 <= p < 80) or (200 <= p < 280) or (400 <= p < 480)
+    if state == S_ERR:     return (now_ms % 200) < 100
     return False
 
 # --- Filesystem helpers ---
@@ -139,395 +84,185 @@ def next_name(prefix="bno", ext="bin"):
     n = 0
     while True:
         name = f"/sd/{prefix}_{n:03d}.{ext}"
-        try:
-            uos.stat(name); n += 1
-        except OSError:
-            return name
+        try: uos.stat(name); n += 1
+        except OSError: return name
 
 def mount_sd():
-    """Mount SD card with error diagnostics."""
-    try:
-        print("Mounting SD card...")
-        # Check power status before mounting
-        status = read_battery_status()
-        if status and not status["usb"]:
-            print(f"  Running on battery (VSYS: {status['vsys_v']:.2f}V)")
-            print("  NOTE: Ensure SD breakout is powered from 3V3(OUT) or VSYS, NOT VBUS!")
-        
-        # Initialize SPI at lower speed first
-        spi = SPI(1, baudrate=1_000_000, polarity=0, phase=0,
-                  sck=Pin(10), mosi=Pin(11), miso=Pin(12))
-        sd = sdcard.SDCard(spi, Pin(CS_PIN, Pin.OUT, value=1))
-        uos.mount(sd, "/sd")
-        # Switch to full speed after mount
-        spi.init(baudrate=SPI_BAUD)
-        print("SD card mounted successfully")
-        return sd, spi
-    except Exception as e:
-        error_msg = str(e)
-        print(f"SD card mount FAILED: {error_msg}")
-        if "OSError" in str(type(e)) or "ENODEV" in error_msg:
-            print("  DIAGNOSIS: SD card not detected or not powered")
-            print("  CHECK:")
-            print("    1. SD breakout VCC → 3V3(OUT) (pin 36) or VSYS (pin 39)")
-            print("    2. SD breakout VCC NOT connected to VBUS (pin 40)")
-            print("    3. SD card inserted properly")
-            print("    4. All SPI connections: CS(13), SCK(10), MOSI(11), MISO(12)")
-            print("    5. Common GND connection")
-        raise
+    print("Mounting SD card…")
+    spi = SPI(1, baudrate=1_000_000, polarity=0, phase=0,
+              sck=Pin(10), mosi=Pin(11), miso=Pin(12))
+    sd  = sdcard.SDCard(spi, Pin(CS_PIN, Pin.OUT, value=1))
+    uos.mount(sd, "/sd")
+    spi.init(baudrate=SPI_BAUD)
+    print("SD card mounted.")
+    return sd, spi
 
 def umount_sd():
     try: uos.umount("/sd")
     except: pass
 
-# --- BNO bring-up (will be initialized in main) ---
-i2c = None
-bno = None
+# --- BNO setup ---
+i2c = I2C(0, sda=Pin(4), scl=Pin(5), freq=I2C_FREQ)
+bno = BNO08X(i2c, debug=False)
+bno.enable_feature(BNO_REPORT_ACCELEROMETER, BIAS_RATE)
+bno.enable_feature(BNO_REPORT_GRAVITY,      BIAS_RATE)
 
 def still_bias(seconds=BIAS_SECS):
-    n = int(seconds * BIAS_RATE)
-    sx = sy = sz = 0.0
-    dt_bias = int(1000 // BIAS_RATE)
+    n = int(seconds * BIAS_RATE); sx=sy=sz=0.0; dt=int(1000//BIAS_RATE)
     for k in range(n):
-        ax, ay, az = bno.acc
-        gx, gy, gz = bno.gravity
-        sx += ax - gx; sy += ay - gy; sz += az - gz
-        if (k & 7) == 0: gc_collect()
-        sleep_ms(dt_bias)
+        ax,ay,az = bno.acc; gx,gy,gz = bno.gravity
+        sx += ax-gx; sy += ay-gy; sz += az-gz
+        if (k & 7)==0: gc_collect()
+        sleep_ms(dt)
     return sx/n, sy/n, sz/n
 
-# switch to logging features/rates
 def enable_logging_features():
     bno.enable_feature(BNO_REPORT_ACCELEROMETER, RATE_HZ)
     bno.enable_feature(BNO_REPORT_GRAVITY,      RATE_HZ)
     bno.enable_feature(BNO_REPORT_GAME_ROTATION_VECTOR, RATE_HZ)
     bno.set_quaternion_euler_vector(BNO_REPORT_GAME_ROTATION_VECTOR)
 
-# --- Recording loop (double-buffered + pack_into) ---
+# --- Recording loop (double-buffered) ---
 def record_session(bias_xyz, fname):
-    """Record session with robust error handling."""
-    bx, by, bz = bias_xyz
-    f = None
-    widx = 0
-    total = 0
-    blocks_written = 0
-    t_first_sample = None
-    t_last_sample = None
-    
+    global stop_flag
+    stop_flag = False  # clear any prior latch
+
+    bx,by,bz = bias_xyz
+    f = open(fname, "wb")
+    f.write(struct.pack("<IBHB", 0x424E4F31, 1, RATE_HZ, 0))  # "BNO1"
+
+    buf_a = bytearray(REC_SIZE * BLOCK_RECS)
+    buf_b = bytearray(REC_SIZE * BLOCK_RECS)
+    active = buf_a
+    pack_into = struct.pack_into
+    widx = 0; total=0; blocks=0
+    t0 = ticks_ms(); t_last = t0
+    t_first = None; t_last_samp = None
+
+    print("Recording ->", fname, "| rate =", RATE_HZ, "Hz")
+    led.value(1)  # solid while recording
+
     try:
-        f = open(fname, "wb")
-        # header: magic(4) ver(1) rate(2) reserved(1)
-        f.write(struct.pack("<IBHB", 0x424E4F31, 1, RATE_HZ, 0))  # "BNO1"
-
-        # Double-buffered: two pre-allocated buffers
-        buf_a = bytearray(REC_SIZE * BLOCK_RECS)
-        buf_b = bytearray(REC_SIZE * BLOCK_RECS)
-        active_buf = buf_a
-        write_buf = None
-        pack_into = struct.pack_into
-        
-        t0 = ticks_ms()
-        t_last = t0
-
-        print("Recording ->", fname, "| rate =", RATE_HZ, "Hz")
         while True:
+            # honor stop as soon as possible (latched by IRQ)
+            if stop_flag:
+                print("Stop requested (button).")
+                break
+
             now = ticks_ms()
-            # Solid LED during recording
-            led.value(1)
-
-            # stop on button press (debounced)
-            if btn_pressed():
-                sleep_ms(40)
-                if btn_pressed():
-                    break
-
-            # Track sample times for effective rate calculation
-            if t_first_sample is None:
-                t_first_sample = now
-            t_last_sample = now
-
+            if t_first is None: t_first = now
+            t_last_samp = now
             t_ms = ticks_diff(now, t0)
-            ax, ay, az = bno.acc
-            gx, gy, gz = bno.gravity
-            lx, ly, lz = ax - gx - bx, ay - gy - by, az - gz - bz
-            qi, qj, qk, qr = bno.quaternion
 
-            pack_into(REC_FMT, active_buf, widx * REC_SIZE, t_ms, lx, ly, lz, qi, qj, qk, qr)
+            # read sensors
+            ax,ay,az = bno.acc
+            gx,gy,gz = bno.gravity
+            lx,ly,lz = ax-gx-bx, ay-gy-by, az-gz-bz
+            qi,qj,qk,qr = bno.quaternion
+
+            pack_into(REC_FMT, active, widx*REC_SIZE, t_ms, lx,ly,lz, qi,qj,qk,qr)
             widx += 1; total += 1
 
             if widx == BLOCK_RECS:
-                # Switch buffers: active -> write, alternate -> active
-                write_buf = active_buf
-                active_buf = buf_b if active_buf is buf_a else buf_a
+                # swap buffers and write the full one
+                to_write = active
+                active = buf_b if active is buf_a else buf_a
                 widx = 0
-                
-                # Write the filled buffer (non-blocking if double-buffered)
+
                 t_w0 = ticks_ms()
-                f.write(write_buf)
-                # No flush here - only flush periodically or at stop
-                blocks_written += 1
-                
-                # Periodic flush if configured
-                if FLUSH_EVERY_N > 0 and (blocks_written % FLUSH_EVERY_N == 0):
+                f.write(to_write); blocks += 1
+                # visible activity each block
+                led.value(0); sleep_ms(8); led.value(1)
+
+                if FLUSH_EVERY_N and (blocks % FLUSH_EVERY_N == 0):
                     f.flush()
-                    print("[FLUSH] blocks=%d samples=%d (flushed)" % (blocks_written, total))
+                    print("[FLUSH] blocks=%d samples=%d (%.1f KiB)" %
+                          (blocks, total, (REC_SIZE*BLOCK_RECS)/1024))
                 else:
                     print("[BLOCK] blocks=%d samples=%d wrote=%d bytes in %d ms" %
-                          (blocks_written, total, len(write_buf), ticks_diff(ticks_ms(), t_w0)))
-                
-                # Brief LED flicker on block write
-                led.value(0); sleep_ms(10); led.value(1)
+                          (blocks, total, len(to_write), ticks_diff(ticks_ms(), t_w0)))
                 gc_collect()
 
-            # Status prints commented out for max rate stability
-            # if ticks_diff(now, t_last) >= STATUS_MS:
-            #     print("[STAT] t=%.1fs count=%d (lx,ly,lz)=(%.3f,%.3f,%.3f)" %
-            #           (ticks_diff(now, t0)/1000, total, lx, ly, lz))
-            #     t_last = now
+            # periodic status
+            if ticks_diff(now, t_last) >= STATUS_MS:
+                print("[STAT] t=%.1fs count=%d (lx,ly,lz)=(%.3f,%.3f,%.3f)" %
+                      (ticks_diff(now, t0)/1000, total, lx, ly, lz))
+                t_last = now
 
-            # pace
-            elapsed = ticks_diff(ticks_ms(), now)
-            rem = DT_MS - elapsed
-            if rem > 0:
-                sleep_ms(rem)
-            if (total & 511) == 0:
-                gc_collect()
-    
-    except KeyboardInterrupt:
-        print("Recording interrupted by user")
-        raise
-    except Exception as e:
-        print(f"Error during recording: {e}")
-        raise
+            # pacing
+            rem = DT_MS - ticks_diff(ticks_ms(), now)
+            if rem > 0: sleep_ms(rem)
+            if (total & 511) == 0: gc_collect()
+
     finally:
-        # Robust close: ensure file is written and closed
-        if f is not None:
+        # write any remainder
+        if widx:
+            f.write(memoryview(active)[:widx*REC_SIZE]); blocks += 1
+        try:
+            f.flush(); led.value(0); sleep_ms(20); led.value(1); f.close()
+        except: pass
+        # sidecar meta
+        if t_first and t_last_samp:
+            dur_ms = ticks_diff(t_last_samp, t_first)
+            eff = (total*1000.0/dur_ms) if dur_ms>0 else 0.0
+            meta = fname.replace(".bin", "_meta.txt")
             try:
-                # Write remaining partial block
-                if widx > 0:
-                    f.write(memoryview(active_buf)[:widx*REC_SIZE])
-                    blocks_written += 1
-                
-                # Final flush and close
-                f.flush()
-                f.close()
-                print("File safely closed:", fname)
-            except Exception as e:
-                print(f"Warning: Error closing file: {e}")
-        
-        # Calculate and write effective sample rate to sidecar file
-        if t_first_sample and t_last_sample:
-            duration_ms = ticks_diff(t_last_sample, t_first_sample)
-            effective_rate = (total * 1000.0 / duration_ms) if duration_ms > 0 else 0.0
-            
-            # Write metadata to sidecar file
-            meta_fname = fname.replace(".bin", "_meta.txt")
-            try:
-                with open(meta_fname, "w") as mf:
+                with open(meta, "w") as mf:
                     mf.write("Recording: %s\n" % fname)
                     mf.write("Target rate: %d Hz\n" % RATE_HZ)
-                    mf.write("Effective rate: %.2f Hz\n" % effective_rate)
+                    mf.write("Effective rate: %.2f Hz\n" % eff)
                     mf.write("Total samples: %d\n" % total)
-                    mf.write("Duration: %.2f s (%.2f min)\n" % (duration_ms/1000.0, duration_ms/60000.0))
-                    mf.write("Blocks written: %d\n" % blocks_written)
-                    mf.write("Block size: %d records (%d bytes)\n" % (BLOCK_RECS, REC_SIZE * BLOCK_RECS))
-                print("Effective sample rate: %.2f Hz (target: %d Hz)" % (effective_rate, RATE_HZ))
-                print("Metadata saved to:", meta_fname)
+                    mf.write("Duration: %.2f s\n" % (dur_ms/1000.0))
+                    mf.write("Blocks: %d\n" % blocks)
+                    mf.write("Block size: %d records (%d bytes)\n" %
+                             (BLOCK_RECS, REC_SIZE*BLOCK_RECS))
+                print("Effective rate: %.2f Hz" % eff)
+                print("Metadata:", meta)
             except Exception as e:
-                print("Warning: Could not write metadata:", e)
-    
-    print("Recording stopped. File closed:", fname)
+                print("Meta write failed:", e)
+        print("Recording stopped. File closed:", fname)
 
-# -------- MAIN FSM --------
+# -------- MAIN --------
 try:
-    state = S_BOOT
-    
-    # Startup delay for battery stability (critical for battery-only operation)
-    sleep_ms(1000)  # Longer delay for battery power stability
-    
-    # Start LED immediately to show script is running (blink pattern)
-    for _ in range(2):
-        led.value(1)
-        sleep_ms(50)
-        led.value(0)
-        sleep_ms(50)
-    
-    # Display battery status at startup (when connected via USB/Thonny)
+    # boot blink
+    for _ in range(2): led.value(1); sleep_ms(60); led.value(0); sleep_ms(60)
     print_battery_status()
-    
-    # Initialize I2C with retry logic
-    print("Initializing I2C...")
-    led.value(1)  # LED on during I2C init
-    i2c = None
-    for attempt in range(3):
-        try:
-            i2c = I2C(0, sda=Pin(4), scl=Pin(5), freq=I2C_FREQ)
-            sleep_ms(200)  # Delay after I2C init
-            # Test I2C by scanning
-            devices = i2c.scan()
-            if devices:
-                print(f"I2C scan found devices: {devices}")
-                led.value(0)
-                sleep_ms(100)
-                led.value(1)  # Flash success
-                sleep_ms(50)
-                led.value(0)
-                break
-            else:
-                print(f"I2C scan attempt {attempt+1} found no devices, retrying...")
-                led.value(0)
-                sleep_ms(100)
-                led.value(1)
-                sleep_ms(300)
-        except Exception as e:
-            print(f"I2C init attempt {attempt+1} failed: {e}")
-            led.value(0)
-            if attempt < 2:
-                sleep_ms(300)
-                led.value(1)
-            else:
-                led.value(0)
-                raise
-    
-    if i2c is None:
-        led.value(0)
-        raise Exception("Failed to initialize I2C after 3 attempts")
-    
-    # Initialize BNO085 with retry logic
-    print("Initializing BNO085...")
-    led.value(1)  # LED on during BNO init
-    bno = None
-    for attempt in range(3):
-        try:
-            sleep_ms(300)  # Extra delay before BNO init
-            bno = BNO08X(i2c, debug=False)
-            sleep_ms(500)  # Allow BNO085 to fully initialize
-            # Object creation successful means I2C communication works
-            print("BNO085 initialized successfully")
-            led.value(0)
-            sleep_ms(100)
-            led.value(1)  # Flash success
-            sleep_ms(50)
-            led.value(0)
-            break
-        except Exception as e:
-            print(f"BNO085 init attempt {attempt+1} failed: {e}")
-            led.value(0)
-            if attempt < 2:
-                # Double blink for retry
-                for _ in range(2):
-                    led.value(1)
-                    sleep_ms(100)
-                    led.value(0)
-                    sleep_ms(100)
-                sleep_ms(500)
-                led.value(1)
-            else:
-                led.value(0)
-                raise
-    
-    if bno is None:
-        led.value(0)
-        raise Exception("Failed to initialize BNO085 after 3 attempts")
-    
-    # Enable features and verify by reading a value
-    print("Enabling BNO085 features...")
-    led.value(1)  # LED on during feature enable
-    for attempt in range(3):
-        try:
-            bno.enable_feature(BNO_REPORT_ACCELEROMETER, BIAS_RATE)
-            sleep_ms(200)  # Allow time for feature to enable
-            bno.enable_feature(BNO_REPORT_GRAVITY,      BIAS_RATE)
-            sleep_ms(300)  # Allow features to enable
-            # Now verify by reading accel (features are enabled)
-            _ = bno.acc  # This verifies communication is working
-            print("BNO085 features enabled and verified")
-            led.value(0)
-            sleep_ms(100)
-            led.value(1)  # Flash success
-            sleep_ms(50)
-            led.value(0)
-            break
-        except Exception as e:
-            print(f"Feature enable attempt {attempt+1} failed: {e}")
-            led.value(0)
-            if attempt < 2:
-                # Triple blink for retry
-                for _ in range(3):
-                    led.value(1)
-                    sleep_ms(80)
-                    led.value(0)
-                    sleep_ms(80)
-                sleep_ms(500)
-                led.value(1)
-            else:
-                led.value(0)
-                raise
-    
-    print("Initializing bias… keep the unit still.")
-    # show bias pattern during acquisition
-    t_bias0 = ticks_ms()
-    while ticks_diff(ticks_ms(), t_bias0) < (BIAS_SECS * 1000):
-        led.value(1 if blink_pattern(ticks_ms(), state) else 0)
-        sleep_ms(10)
-    bx, by, bz = still_bias()
-    print("Bias (lin-acc) ~ bx=%.4f by=%.4f bz=%.4f" % (bx, by, bz))
 
-    # enable full logging features
-    enable_logging_features()
-    gc_collect()
+    print("Initializing I2C/BNO…")
+    # (i2c and bno already created above)
 
-    # Check battery status before SD mount (if on battery)
-    status = read_battery_status()
-    if status and not status["usb"]:
-        if status["percent"] is not None and status["percent"] < 10:
-            raise Exception(f"Battery too low ({status['percent']}%). Charge before use. VSYS: {status['vsys_v']:.2f}V")
-        if status["vsys_v"] < 3.5:
-            raise Exception(f"VSYS too low ({status['vsys_v']:.2f}V). Charge before use.")
+    print("Biasing… keep still.")
+    t0 = ticks_ms()
+    while ticks_diff(ticks_ms(), t0) < (BIAS_SECS*1000):
+        led.value(1 if blink_pattern(ticks_ms(), S_BOOT) else 0); sleep_ms(10)
+    bx,by,bz = still_bias()
+    print("Bias ~ bx=%.4f by=%.4f bz=%.4f" % (bx,by,bz))
 
-    # mount SD and go READY
-    try:
-        sd, spi = mount_sd()
-    except Exception as e:
-        error_msg = str(e)
-        if "mount" in error_msg.lower() or "sdcard" in error_msg.lower() or "spi" in error_msg.lower():
-            raise Exception(f"SD card mount failed. Check wiring: SD breakout VCC must be on 3V3(OUT) or VSYS, NOT VBUS. Original error: {error_msg}")
-        raise
-    state = S_READY
-    print("Ready. Press button to START recording.")
+    enable_logging_features(); gc_collect()
+
+    # SD mount and READY
+    sd, spi = mount_sd()
+    print("Ready. Press button to START.")
     while not btn_pressed():
-        led.value(1 if blink_pattern(ticks_ms(), state) else 0)
-        sleep_ms(20)
-    while btn_pressed(): sleep_ms(10)  # release
+        led.value(1 if blink_pattern(ticks_ms(), S_READY) else 0); sleep_ms(20)
+    # wait for release (debounce)
+    while btn_pressed(): sleep_ms(10)
 
-    # start recording
-    state = S_REC
+    # RECORD
     led.value(1)
     fname = next_name()
-    record_session((bx, by, bz), fname)
+    record_session((bx,by,bz), fname)
 
-    # STOPPING
-    state = S_STOPPING
+    # STOP / UNMOUNT
+    print("Unmounting SD…")
     umount_sd()
     t1 = ticks_ms()
-    while ticks_diff(ticks_ms(), t1) < 1000:
-        led.value(1 if blink_pattern(ticks_ms(), state) else 0)
-        sleep_ms(10)
+    while ticks_diff(ticks_ms(), t1) < 800:
+        led.value(1 if blink_pattern(ticks_ms(), S_STOPPING) else 0); sleep_ms(10)
     led.value(0)
-    print("SD unmounted. Safe to power off.")
+    print("Done. Safe to power off.")
 
 except Exception as e:
-    state = S_ERR
-    led.value(0)
-    # Triple flash before error pattern to make it visible
-    for _ in range(3):
-        led.value(1)
-        sleep_ms(100)
-        led.value(0)
-        sleep_ms(100)
-    sleep_ms(200)
     print("ERROR:", e)
-    # Fast blink error pattern (indefinitely)
     while True:
-        led.value(1 if blink_pattern(ticks_ms(), state) else 0)
-        sleep_ms(20)
+        led.value(1 if blink_pattern(ticks_ms(), S_ERR) else 0); sleep_ms(20)
