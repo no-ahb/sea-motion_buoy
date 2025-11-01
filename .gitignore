@@ -29,5 +29,8 @@ Thumbs.db
 # recordings/decoded/*.csv
 # recordings/decoded/*.json
 
+# Generated CSV files from decoder
+recordings/**/*.csv
+
 # Keep directory structure but ignore large files
 # *.bin
