@@ -90,6 +90,8 @@ def write_csv(path: str, rows: Iterable[Tuple]) -> None:
 
 def write_plots(path: str, records: List[Tuple]) -> None:
     try:
+        import matplotlib  # type: ignore
+        matplotlib.use("Agg")  # headless-friendly
         import matplotlib.pyplot as plt  # type: ignore
     except ImportError as exc:  # pragma: no cover - optional dependency
         raise RuntimeError(

@@ -1,5 +1,5 @@
 from machine import I2C, Pin, SPI, ADC
-from utime import ticks_ms, ticks_diff, sleep_ms
+from utime import ticks_ms, ticks_diff, sleep_ms, ticks_add
 from gc import collect as gc_collect
 import uos, struct, sdcard
 from bno08x import *
@@ -8,7 +8,7 @@ from bno08x import *
 RATE_HZ       = 100            # start at 100 Hz (stable); try 200 after verifying
 BIAS_RATE     = 25
 BIAS_SECS     = 10
-BLOCK_RECS    = 1024            # 16 KiB blocks (512 * 32 B)
+BLOCK_RECS    = 1024            # 32 KiB blocks (1024 * 32 B)
 FLUSH_EVERY_N = 0              # visible flushing while you debug
 I2C_FREQ      = 400_000
 SPI_BAUD      = 12_000_000
@@ -116,6 +116,8 @@ def record_session(bias_xyz, fname):
     led.value(1)
 
     try:
+        # Fixed-deadline scheduler: do not rebase to 'now' each loop
+        next_t = ticks_add(ticks_ms(), DT_MS)
         while True:
             if stop_flag:
                 print("Stop requested."); break
@@ -138,14 +140,11 @@ def record_session(bias_xyz, fname):
                 to_write=active
                 active=buf_b if active is buf_a else buf_a
                 widx=0
-                t_w0=ticks_ms()
+                # Fast write; avoid prints in hot path
                 f.write(to_write); blocks+=1
                 led.value(0); sleep_ms(8); led.value(1)
                 if FLUSH_EVERY_N and (blocks%FLUSH_EVERY_N==0):
-                    f.flush(); print("[FLUSH] blocks=%d samples=%d" % (blocks,total))
-                else:
-                    print("[BLOCK] blocks=%d samples=%d wrote=%d bytes in %d ms"
-                          % (blocks,total,len(to_write),ticks_diff(ticks_ms(),t_w0)))
+                    f.flush()
                 gc_collect()
 
 #             if ticks_diff(now,t_last)>=STATUS_MS:
@@ -153,8 +152,10 @@ def record_session(bias_xyz, fname):
 #                       % (ticks_diff(now,t0)/1000,total,lx,ly,lz))
 #                 t_last=now
 
-            rem=DT_MS - ticks_diff(ticks_ms(), now)
-            if rem>0: sleep_ms(rem)
+            # Fixed-deadline pacing
+            next_t = ticks_add(next_t, DT_MS)
+            d = ticks_diff(next_t, ticks_ms())
+            if d>0: sleep_ms(d)
             if (total & 511)==0: gc_collect()
 
     finally:
