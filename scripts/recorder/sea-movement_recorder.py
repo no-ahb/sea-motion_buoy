@@ -1,5 +1,6 @@
 from machine import I2C, Pin, SPI, ADC
 from utime import ticks_ms, ticks_diff, sleep_ms, ticks_add
+from array import array
 from gc import collect as gc_collect
 import uos, struct, sdcard
 from bno08x import *
@@ -116,6 +117,9 @@ def record_session(bias_xyz, fname):
     led.value(1)
 
     try:
+        # Preallocate buffers for zero-alloc combined reads
+        acc3 = array('f', [0.0, 0.0, 0.0])
+        quat4 = array('f', [0.0, 0.0, 0.0, 0.0])
         # Fixed-deadline scheduler: do not rebase to 'now' each loop
         next_t = ticks_add(ticks_ms(), DT_MS)
         while True:
@@ -127,11 +131,11 @@ def record_session(bias_xyz, fname):
             t_last_s=now
             t_ms=ticks_diff(now,t0)
 
-            # ONE read of lin-acc + ONE read of quaternion
-            lx,ly,lz=bno.acc_linear      # direct from sensor
+            # Combined drain of FIFO and zero-alloc copy into preallocated arrays
+            bno.read_combined_into(acc3, quat4)
             # subtract the small still-bias (helps DC offsets)
-            lx-=bx; ly-=by; lz-=bz
-            qi,qj,qk,qr=bno.quaternion
+            lx = acc3[0] - bx; ly = acc3[1] - by; lz = acc3[2] - bz
+            qi, qj, qk, qr = quat4
 
             pack_into(REC_FMT, active, widx*REC_SIZE, t_ms, lx,ly,lz, qi,qj,qk,qr)
             widx+=1; total+=1
@@ -140,9 +144,14 @@ def record_session(bias_xyz, fname):
                 to_write=active
                 active=buf_b if active is buf_a else buf_a
                 widx=0
-                # Fast write; avoid prints in hot path
+                # Fast write; avoid prints/sleeps in hot path
                 f.write(to_write); blocks+=1
-                led.value(0); sleep_ms(8); led.value(1)
+                # Non-blocking visual cue
+                try:
+                    led.toggle()
+                except AttributeError:
+                    # Fallback if toggle() not available
+                    led.value(0 if led.value() else 1)
                 if FLUSH_EVERY_N and (blocks%FLUSH_EVERY_N==0):
                     f.flush()
                 gc_collect()
