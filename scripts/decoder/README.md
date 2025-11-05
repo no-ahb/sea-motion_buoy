@@ -5,20 +5,30 @@ Python 3 scripts for decoding binary recording files from the ocean motion logge
 ## Usage
 
 ```bash
-# From project root
+# From project root (basic summary)
 python scripts/decoder/sea-movement_decoder.py recordings/test/test_runs/001_on\ desk/bno_009.bin
 
-# Or from decoder directory
-cd scripts/decoder
-python sea-movement_decoder.py ../../recordings/test/test_runs/001_on\ desk/bno_009.bin
+# Decode + downsample to 10 Hz + trimmed mean + PSD plot
+python scripts/decoder/sea-movement_decoder.py \
+  recordings/test/test_runs/001_on\ desk/bno_009.bin \
+  --downsample 10 --robust trimmed --highpass 0.05 \
+  --csv out_10hz.csv --plot out_timeseries.png \
+  --psd out_psd.csv --psd-plot out_psd.png
 ```
+
+### Key Options
+
+- `--downsample <Hz>` – aggregate samples to a lower rate (median/trimmed/mean).
+- `--highpass <Hz>` – first-order high-pass on linear acceleration.
+- `--csv / --plot` – export CSV and time-series plot.
+- `--psd / --psd-plot` – write acceleration PSD (requires `numpy`, optionally `matplotlib`).
 
 ## Output
 
 The decoder prints:
-- File header information (magic, version, sample rate)
-- Total number of samples read
-- First 5 samples in format: `(t_ms, lx, ly, lz, qi, qj, qk, qr)`
+- Header summary (magic, version, sample rate, device ID, bias, CRC if present)
+- Total number of records read
+- First `--head` samples `(t_ms, lx, ly, lz, qi, qj, qk, qr)`
 
 ## Processing Workflow
 
@@ -35,10 +45,11 @@ For stepper motor playback, the recorded data follows this pipeline:
 ## Future Enhancements
 
 ### Immediate
-- Export to CSV/NumPy formats
-- Metadata extraction (recording duration, sample count, effective rate)
-- Data validation (quaternion normalization, timestamp continuity)
-- Statistics summary (mean, std, range)
+- [x] Export to CSV
+- [x] Metadata extraction (rate, sample count, bias, CRC)
+- [x] Optional plotting for QA (time series, PSD)
+- [ ] Add statistics summary (mean, std, quaternion norm drift)
+- [ ] Timestamp continuity + CRC verification check
 
 ### Processing
 - Compute **Up vector** from quaternion → project linear accel
@@ -46,4 +57,3 @@ For stepper motor playback, the recorded data follows this pipeline:
 - Double integration → displacement reconstruction
 - Downsampling and normalization for motor control
 - Optional plotting for QA (acceleration, quaternion norm)
-

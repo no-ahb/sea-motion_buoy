@@ -1,13 +1,13 @@
 # TODO: Ocean Motion Sensing Buoy
 *Active development & task tracking — maintained by agents*
 
-**Last updated:** [Auto-updated by agents]
+**Last updated:** 2024-11-03 – Added header metadata/CRC, QA sampling, decoder PSD tools, 30 s bias.
 
 ---
 
 ## To Do Now (go through this, erase any tasks completed, add them to the changelog, update "last updated" with brief memo of tasks completed, renumber or edit remaining tasks )
-1. check calibration on boot, should it be changed?
-2. 
+1. Run 1 h desk soak with new 30 s bias to confirm stability & log QA CSV results.
+2. Use decoder PSD tooling on next dataset to pick default high-pass cutoff.
 
 
 ---
@@ -28,7 +28,7 @@
 
 * [x] Integrate double-buffer + block write system for stable 100–200 Hz logging.
 * [x] Add "effective sample rate" metadata to log or sidecar file.
-* [ ] Add optional CRC per block for data integrity.
+* [x] Add per-file CRC + enriched header metadata for data integrity.
 * [ ] Optimize power (reduce SD writes, limit LED use during idle).
 * [x] Retain LED/button FSM (bias → ready → recording → stop).
 
@@ -58,8 +58,14 @@
 ## Feature Suggestions
 
 ### Short-Term
-* Add recording metadata (device ID, start time, duration) to header.
+* [x] Add recording metadata (device ID, start time, duration) to header.
 * Add LED “error” pattern (fast blink) for SD/IMU init failures.
 
 ### Long-Term
-* Add gyro or temperature channels for QA.
+* [x] Add gyro snapshots for QA logging (every 5 s during runs).
+
+### Someday / Nice-to-Have
+1. **BNO08x UART mode (≥1 Mbps) for future >100 Hz logging** – Swap the IMU link from I²C to UART when higher rates are needed; lowers bus latency and jitter but increases wiring/driver complexity.
+2. **Back-pressure metrics and watchdog** – Record queue depth/overrun stats and flash a warning pattern if the writer saturates; valuable for post-mortem analysis with negligible runtime cost.
+3. **Periodic fsync checkpoints (every 30–60 s)** – Bound data loss on sudden power cuts at the expense of predictable, brief SD stalls during each sync.
+4. **Driver micro-optimizations / optional C shim** – Rework BNO08x caches to reuse arrays or port hot paths to C for lower latency; improves headroom but raises maintenance overhead.
