@@ -51,20 +51,17 @@ QA_FEATURE_RATE        = min(25, max(5, RATE_HZ))
 # --- Power (optional) ---
 VBUS_SENSE = Pin(24, Pin.IN)
 VSYS_ADC   = ADC(29); VREF=3.3; DIV=3.0
-def print_battery_status():
-    raw = VSYS_ADC.read_u16()
-    vsys = (raw/65535.0)*VREF*DIV
-    print("="*40)
 
 def read_vsys_voltage():
     raw = VSYS_ADC.read_u16()
-    vsys = (raw/65535.0)*VREF*DIV
-    return vsys, raw
-    if VBUS_SENSE.value():
-        print("Power: USB, VSYS=%.2f V (ADC=%d)" % (vsys, raw))
-    else:
-        print("Power: Battery, VSYS=%.2f V (ADC=%d)" % (vsys, raw))
-    print("="*40)
+    return (raw / 65535.0) * VREF * DIV, raw
+
+def print_battery_status():
+    vsys, raw = read_vsys_voltage()
+    src = "USB" if VBUS_SENSE.value() else "Battery"
+    print("=" * 40)
+    print("Power:", src, "VSYS=%.2f V (ADC=%d)" % (vsys, raw))
+    print("=" * 40)
 
 # --- LED / Button (IRQ-latched stop) ---
 led = Pin(LED_PIN, Pin.OUT, value=0)
@@ -149,10 +146,18 @@ def record_session(bias_xyz, fname):
     header_values = [HEADER_MAGIC, HEADER_VERSION, HEADER_SIZE, RATE_HZ, header_flags,
                      session_epoch, session_ticks, DEVICE_ID, bx, by, bz, 0, 0]
     f.write(struct.pack(HEADER_FMT, *header_values))
+    qa_path = fname.replace(".bin", "_qa.csv")
+    qa_file = None
+    try:
+        qa_file = open(qa_path, "w")
+        qa_file.write("t_ms,ax,ay,az,gx,gy,gz,qnorm\n")
+    except Exception:
+        qa_file = None
 
     block_bytes = REC_SIZE * BLOCK_RECS
     have_thread = bool(start_new_thread and allocate_lock)
     buf_count = 6 if have_thread else 2
+    queue_capacity = (buf_count - 1) if have_thread and buf_count > 1 else buf_count
     buffers = [bytearray(block_bytes) for _ in range(buf_count)]
     active_idx = 0
     active_mv = memoryview(buffers[active_idx])
@@ -184,7 +189,7 @@ def record_session(bias_xyz, fname):
     acc3 = array('f', [0.0, 0.0, 0.0])
     quat4 = array('f', [0.0, 0.0, 0.0, 1.0])
     crc32_accum = 0
-    qa_samples = []
+    qa_sample_count = 0
     qa_counter = QA_SAMPLE_INTERVAL_REC
 
     def release_buffer(idx):
@@ -223,7 +228,7 @@ def record_session(bias_xyz, fname):
         if have_thread:
             while True:
                 q_lock.acquire()
-                if q_count < buf_count:
+                if q_count < queue_capacity:
                     queue_depth = q_count + 1
                     queue_item = (idx, length, flush_flag)
                     q[q_tail] = queue_item
@@ -270,7 +275,7 @@ def record_session(bias_xyz, fname):
                     q[q_head] = None
                     q_head = (q_head + 1) % buf_count
                     q_count -= 1
-                running = writer_run or q_count
+                running = writer_run or (q_count > 0)
                 q_lock.release()
                 if entry:
                     buf_idx, length, flush_flag = entry
@@ -310,7 +315,7 @@ def record_session(bias_xyz, fname):
     LV_THRESH = 3.40
     LV_CHECK_MS = 3000
     lv_count = 0
-    min_vsys = 99.9
+    min_vsys, _ = read_vsys_voltage()
     low_voltage_stop = 0
     next_lv_check = ticks_add(t0, LV_CHECK_MS)
 
@@ -318,8 +323,8 @@ def record_session(bias_xyz, fname):
     led.value(1)
 
     try:
-        # Use combined driver read (bounded/non-alloc in driver) per tick
-        combined_read = True
+        # Use combined driver read (bounded/non-alloc in driver) per tick if available
+        combined_read = hasattr(bno, "read_combined_into")
         next_t = ticks_add(ticks_ms(), DT_MS)
         while True:
             if stop_flag:
@@ -392,17 +397,22 @@ def record_session(bias_xyz, fname):
             qa_counter -= 1
             if qa_counter <= 0:
                 qa_counter = QA_SAMPLE_INTERVAL_REC
-                if len(qa_samples) < QA_MAX_SAMPLES:
+                try:
+                    ax_q, ay_q, az_q = bno.acc
+                except Exception:
+                    ax_q = ay_q = az_q = 0.0
+                try:
+                    gx_q, gy_q, gz_q = bno.gyro
+                except Exception:
+                    gx_q = gy_q = gz_q = 0.0
+                qnorm = sqrt((qi * qi) + (qj * qj) + (qk * qk) + (qr * qr))
+                qa_sample_count += 1
+                if qa_file:
                     try:
-                        ax_q, ay_q, az_q = bno.acc
+                        qa_file.write("%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n" % (t_ms, ax_q, ay_q, az_q, gx_q, gy_q, gz_q, qnorm))
+                        qa_file.flush()
                     except Exception:
-                        ax_q = ay_q = az_q = 0.0
-                    try:
-                        gx_q, gy_q, gz_q = bno.gyro
-                    except Exception:
-                        gx_q = gy_q = gz_q = 0.0
-                    qnorm = sqrt((qi * qi) + (qj * qj) + (qk * qk) + (qr * qr))
-                    qa_samples.append((t_ms, ax_q, ay_q, az_q, gx_q, gy_q, gz_q, qnorm))
+                        pass
 
             if widx == BLOCK_RECS:
                 blocks += 1
@@ -450,22 +460,21 @@ def record_session(bias_xyz, fname):
         except Exception:
             pass
         try:
+            qa_file.flush(); qa_file.close()
+        except Exception:
+            pass
+        if qa_sample_count:
+            print("QA samples:", qa_path, "count:", qa_sample_count)
+        else:
+            print("QA samples: none logged")
+        try:
             header_values[-2] = total & 0xFFFFFFFF
             header_values[-1] = crc32_accum & 0xFFFFFFFF
             with open(fname, "r+b") as hf:
+                hf.seek(0)
                 hf.write(struct.pack(HEADER_FMT, *header_values))
         except Exception as e:
             print("Header rewrite failed:", e)
-        qa_path = fname.replace(".bin", "_qa.csv")
-        try:
-            if qa_samples:
-                with open(qa_path, "w") as qf:
-                    qf.write("t_ms,ax,ay,az,gx,gy,gz,qnorm\n")
-                    for row in qa_samples:
-                        qf.write("%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n" % row)
-                print("QA samples:", qa_path, "count:", len(qa_samples))
-        except Exception as e:
-            print("QA write failed:", e)
         if t_first and t_last_s:
             dur = ticks_diff(t_last_s, t_first)
             eff = ((total - 1) * 1000.0 / dur) if (dur > 0 and total > 1) else 0.0
@@ -475,7 +484,7 @@ def record_session(bias_xyz, fname):
                     mf.write("Recording: %s\n" % fname)
                     mf.write("Target rate: %d Hz\n" % RATE_HZ)
                     mf.write("Header version: %d\n" % HEADER_VERSION)
-                    mf.write("Start epoch (UTC): %d\n" % session_epoch)
+                    mf.write("Start epoch (s): %d\n" % session_epoch)
                     mf.write("Start ticks (ms): %d\n" % session_ticks)
                     mf.write("Device ID: 0x%08X\n" % DEVICE_ID)
                     mf.write("CRC32 (records): 0x%08X\n" % (crc32_accum & 0xFFFFFFFF))
@@ -494,8 +503,8 @@ def record_session(bias_xyz, fname):
                     mf.write("Writer total bytes: %d\n" % total_write_bytes)
                     mf.write("Checkpoints (flush+sync): %d\n" % checkpoint_count)
                     mf.write("Low voltage stop: %d (thresh=%.2f V, min_vsys=%.2f V)\n" % (low_voltage_stop, LV_THRESH, min_vsys))
-                    mf.write("QA sample count: %d (every %d samples)\n" % (len(qa_samples), QA_SAMPLE_INTERVAL_REC))
-                    if qa_samples:
+                    mf.write("QA sample count: %d (every %d samples)\n" % (qa_sample_count, QA_SAMPLE_INTERVAL_REC))
+                    if qa_sample_count:
                         mf.write("QA CSV: %s\n" % qa_path)
                 print("Effective rate: %.6f Hz" % eff); print("Metadata:", meta)
             except Exception as e:
