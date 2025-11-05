@@ -4,6 +4,7 @@ import math
 import os
 import struct
 import sys
+import binascii
 from typing import Dict, Iterable, List, Sequence, Tuple
 
 HEADER_V1_MAGIC = 0x424E4F31  # 'BNO1'
@@ -71,6 +72,11 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         metavar="OUT.png",
         help="Plot the acceleration PSD (requires numpy and matplotlib).",
     )
+    parser.add_argument(
+        "--verify-crc",
+        action="store_true",
+        help="Recompute CRC32 over records and compare with header (if present).",
+    )
     return parser.parse_args(argv)
 
 
@@ -129,6 +135,7 @@ def decode_file(path: str) -> Tuple[Dict[str, object], List[Tuple]]:
         }
         offset = HEADER_V1_SIZE
 
+    crc_calc = 0
     for cursor in range(offset, len(data), RECORD_SIZE):
         chunk = data[cursor : cursor + RECORD_SIZE]
         if len(chunk) != RECORD_SIZE:
@@ -138,8 +145,10 @@ def decode_file(path: str) -> Tuple[Dict[str, object], List[Tuple]]:
                 file=sys.stderr,
             )
             break
+        crc_calc = binascii.crc32(chunk, crc_calc) & 0xFFFFFFFF
         records.append(struct.unpack(RECORD_FORMAT, chunk))
 
+    header["crc32_calc"] = crc_calc
     return header, records
 
 
@@ -175,6 +184,33 @@ def show_summary(header: Dict[str, object], records: List[Tuple], head: int) -> 
     print(f"Read {len(records)} samples.")
     if not records:
         return
+    # Jitter summary (based on t_ms deltas)
+    dts = [records[i][0] - records[i-1][0] for i in range(1, len(records))]
+    if dts:
+        import statistics as stats
+        dt_ms = 1000.0 / float(header["rate_hz"]) if header.get("rate_hz") else None
+        mean_dt = stats.mean(dts)
+        std_dt = stats.pstdev(dts) if len(dts) > 1 else 0.0
+        p95 = sorted(dts)[int(0.95 * (len(dts)-1))]
+        p99 = sorted(dts)[int(0.99 * (len(dts)-1))]
+        dt_min = min(dts); dt_max = max(dts)
+        late20 = sum(1 for x in dts if x > 20)
+        late50 = sum(1 for x in dts if x > 50)
+        missed = 0
+        if dt_ms is not None and dt_ms > 0:
+            import math
+            missed = sum(max(0, int(x // dt_ms) - 1) for x in dts)
+        derived_rate = ((len(records) - 1) * 1000.0) / (records[-1][0] - records[0][0]) if len(records) > 1 else 0.0
+        print(
+            (
+                "Timing: dt mean=%.2f ms, std=%.2f, min=%.0f, p95=%.0f, p99=%.0f, max=%.0f; "
+                "late20=%d, late50=%d, missed_slots=%d; derived_rate=%.6f Hz"
+            )
+            % (mean_dt, std_dt, dt_min, p95, p99, dt_max, late20, late50, missed, derived_rate)
+        )
+    # CRC summary
+    if header.get("crc32") is not None:
+        print("Header CRC32: 0x%08X, Calculated: 0x%08X" % (header.get("crc32", 0) or 0, header.get("crc32_calc", 0) or 0))
     print("First samples (t_ms, lx, ly, lz, qi, qj, qk, qr):")
     for row in records[: max(head, 0)]:
         print(row)
@@ -407,6 +443,15 @@ def main(argv: Sequence[str]) -> int:
         except Exception as exc:
             print(f"High-pass filter failed: {exc}", file=sys.stderr)
             return 1
+
+    # Optional CRC verify (after decode)
+    if args.verify_crc and header.get("crc32") is not None:
+        calc = header.get("crc32_calc")
+        exp = header.get("crc32")
+        if calc != exp:
+            print("CRC verify: FAIL (expected 0x%08X, got 0x%08X)" % (exp or 0, calc or 0), file=sys.stderr)
+        else:
+            print("CRC verify: OK (0x%08X)" % (calc or 0))
 
     psd_data = None
     if args.psd or args.psd_plot:

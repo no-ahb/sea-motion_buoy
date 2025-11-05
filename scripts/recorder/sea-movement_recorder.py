@@ -16,11 +16,11 @@ except ImportError:
     allocate_lock = None
 
 # -------- CONFIG --------
-RATE_HZ       = 50            # start at 100 Hz (stable); try 200 after verifying
+RATE_HZ       = 50              # sampling rate (stable target)
 BIAS_RATE     = 25
 BIAS_SECS     = 30
 BLOCK_RECS    = 1024            # 32 KiB blocks (1024 * 32 B)
-FLUSH_EVERY_N = 0              # visible flushing while you debug
+FLUSH_EVERY_N = 1               # checkpoint every N full blocks (0 = only at stop)
 I2C_FREQ      = 400_000
 SPI_BAUD      = 24_000_000
 CS_PIN        = 13
@@ -55,6 +55,11 @@ def print_battery_status():
     raw = VSYS_ADC.read_u16()
     vsys = (raw/65535.0)*VREF*DIV
     print("="*40)
+
+def read_vsys_voltage():
+    raw = VSYS_ADC.read_u16()
+    vsys = (raw/65535.0)*VREF*DIV
+    return vsys, raw
     if VBUS_SENSE.value():
         print("Power: USB, VSYS=%.2f V (ADC=%d)" % (vsys, raw))
     else:
@@ -110,12 +115,8 @@ def umount_sd():
     except: pass
 
 # --- BNO ---
-i2c=I2C(0, sda=Pin(4), scl=Pin(5), freq=I2C_FREQ)
-bno=BNO08X(i2c, debug=False)
-
-# enable low-rate for bias
-bno.enable_feature(BNO_REPORT_ACCELEROMETER, BIAS_RATE)
-bno.enable_feature(BNO_REPORT_GRAVITY,      BIAS_RATE)
+i2c = None
+bno = None
 
 def still_bias(sec=BIAS_SECS):
     n=int(sec*BIAS_RATE); sx=sy=sz=0.0; dt=int(1000//BIAS_RATE)
@@ -170,6 +171,7 @@ def record_session(bias_xyz, fname):
     max_write_ms = 0
     q_full_hits = 0
     q_high_water = 0
+    checkpoint_count = 0
     prev_t_ms = None
     late20 = 0
     late50 = 0
@@ -245,11 +247,19 @@ def record_session(bias_xyz, fname):
                 max_write_ms = write_ms
             total_write_bytes += length
             if flush_flag:
-                f.flush()
+                try:
+                    f.flush()
+                    try:
+                        uos.sync()
+                    except Exception:
+                        pass
+                    checkpoint_count += 1
+                except Exception:
+                    pass
             release_buffer(idx)
 
     def writer_loop():
-        nonlocal q_head, q_count, writer_run, writer_done, total_write_bytes, max_write_ms, writer_error
+        nonlocal q_head, q_count, writer_run, writer_done, total_write_bytes, max_write_ms, writer_error, checkpoint_count
         # NOTE: this closure uses the outer 'f'; never rebind 'f' inside.
         try:
             while True:
@@ -272,7 +282,15 @@ def record_session(bias_xyz, fname):
                         max_write_ms = write_ms
                     total_write_bytes += length
                     if flush_flag:
-                        f.flush()
+                        try:
+                            f.flush()
+                            try:
+                                uos.sync()
+                            except Exception:
+                                pass
+                            checkpoint_count += 1
+                        except Exception:
+                            pass
                     release_buffer(buf_idx)
                     continue
                 if not running:
@@ -288,6 +306,13 @@ def record_session(bias_xyz, fname):
 
     pack_into = struct.pack_into
     t0 = ticks_ms(); t_first = None; t_last_s = None
+    # Low-voltage failsafe (debounced)
+    LV_THRESH = 3.40
+    LV_CHECK_MS = 3000
+    lv_count = 0
+    min_vsys = 99.9
+    low_voltage_stop = 0
+    next_lv_check = ticks_add(t0, LV_CHECK_MS)
 
     print("Recording ->",fname,"| rate =",RATE_HZ,"Hz")
     led.value(1)
@@ -322,7 +347,7 @@ def record_session(bias_xyz, fname):
                 else:
                     lx, ly, lz = bno.acc_linear
                     qi, qj, qk, qr = bno.quaternion
-            except MemoryError:
+            except (MemoryError, RuntimeError):
                 read_ok = False
 
             if not read_ok:
@@ -344,6 +369,20 @@ def record_session(bias_xyz, fname):
                 if dt > 50:
                     late50 += 1
             prev_t_ms = t_ms
+
+            # Low-voltage periodic check (debounced)
+            if ticks_diff(now, next_lv_check) >= 0:
+                vsys, _raw = read_vsys_voltage()
+                if vsys < min_vsys:
+                    min_vsys = vsys
+                if vsys < LV_THRESH:
+                    lv_count += 1
+                else:
+                    lv_count = 0
+                if lv_count >= 3 and not low_voltage_stop:
+                    low_voltage_stop = 1
+                    stop_flag = True
+                next_lv_check = ticks_add(now, LV_CHECK_MS)
 
             offset = widx * REC_SIZE
             pack_into(REC_FMT, buffers[active_idx], offset, t_ms, lx, ly, lz, qi, qj, qk, qr)
@@ -367,7 +406,8 @@ def record_session(bias_xyz, fname):
 
             if widx == BLOCK_RECS:
                 blocks += 1
-                enqueue_block(active_idx, block_bytes, False)
+                flush_flag = bool(FLUSH_EVERY_N) and ((blocks % FLUSH_EVERY_N) == 0)
+                enqueue_block(active_idx, block_bytes, flush_flag)
                 try:
                     led.toggle()
                 except AttributeError:
@@ -436,6 +476,7 @@ def record_session(bias_xyz, fname):
                     mf.write("Target rate: %d Hz\n" % RATE_HZ)
                     mf.write("Header version: %d\n" % HEADER_VERSION)
                     mf.write("Start epoch (UTC): %d\n" % session_epoch)
+                    mf.write("Start ticks (ms): %d\n" % session_ticks)
                     mf.write("Device ID: 0x%08X\n" % DEVICE_ID)
                     mf.write("CRC32 (records): 0x%08X\n" % (crc32_accum & 0xFFFFFFFF))
                     mf.write("Bias offsets (m/s^2): %.6f, %.6f, %.6f\n" % (bx, by, bz))
@@ -446,11 +487,13 @@ def record_session(bias_xyz, fname):
                     mf.write("Block size: %d records (%d bytes)\n" % (BLOCK_RECS, REC_SIZE*BLOCK_RECS))
                     mf.write("Late >20 ms gaps: %d\n" % late20)
                     mf.write("Late >50 ms gaps: %d\n" % late50)
-                    mf.write("Missing 10 ms slots: %d\n" % missing_slots)
+                    mf.write("Missed slots (DT_MS=%d ms): %d\n" % (DT_MS, missing_slots))
                     mf.write("Queue high-water: %d\n" % q_high_water)
                     mf.write("Queue full hits: %d\n" % q_full_hits)
                     mf.write("Writer max write ms: %d\n" % max_write_ms)
                     mf.write("Writer total bytes: %d\n" % total_write_bytes)
+                    mf.write("Checkpoints (flush+sync): %d\n" % checkpoint_count)
+                    mf.write("Low voltage stop: %d (thresh=%.2f V, min_vsys=%.2f V)\n" % (low_voltage_stop, LV_THRESH, min_vsys))
                     mf.write("QA sample count: %d (every %d samples)\n" % (len(qa_samples), QA_SAMPLE_INTERVAL_REC))
                     if qa_samples:
                         mf.write("QA CSV: %s\n" % qa_path)
@@ -463,6 +506,15 @@ def record_session(bias_xyz, fname):
 try:
     for _ in range(2): led.value(1); sleep_ms(60); led.value(0); sleep_ms(60)
     print_battery_status()
+
+    print("Initializing I2C…")
+    if i2c is None:
+        i2c = I2C(0, sda=Pin(4), scl=Pin(5), freq=I2C_FREQ)
+
+    print("Initializing BNO085…")
+    bno = BNO08X(i2c, debug=False)
+    bno.enable_feature(BNO_REPORT_ACCELEROMETER, BIAS_RATE)
+    bno.enable_feature(BNO_REPORT_GRAVITY,      BIAS_RATE)
 
     print("Biasing… keep still.")
     t0=ticks_ms()
