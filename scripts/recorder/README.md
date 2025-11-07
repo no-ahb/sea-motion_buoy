@@ -1,32 +1,29 @@
 # Recorder Scripts
 
-MicroPython scripts for the Raspberry Pi Pico 2 to capture 9-DoF IMU data for ocean motion logging.
+MicroPython firmware for the Raspberry Pi Pico 2 + BNO085 stack. `sea-movement_recorder.py` is now the shipping build that produced the 7 h `bno_008` dataset (50 Hz, synchronous writer, QA buffering, SD retries).
 
 ## Files
 
-- `sea-movement_recorder.py` - Production recorder (rename to `main.py` on the Pico)
-- `functional_baselineScript.py` - Legacy baseline script, retained for reference
-- `bno085_test.py` - Test/development script for BNO085 sensor
+- `sea-movement_recorder.py` – Production recorder (copy as `main.py` on Pico)
+- `functional_baselineScript.py` – Legacy baseline, kept for comparison
+- `bno085_test.py` – Quick IMU sanity-check script
 
 ## Upload to Pico
 
-1. Copy files to Pico (via Thonny or similar):
-   - `functional_baselineScript.py` → Rename to `main.py` on Pico (for auto-run on battery)
-   - `bno08x.py` library → Pico root directory:
-     - From: `scripts/library/BOSCH-BNO085-I2C-micropython-library/lib/bno08x.py`
+1. Copy `scripts/library/BOSCH-BNO085-I2C-micropython-library/lib/bno08x.py` to the Pico root.
+2. Open `sea-movement_recorder.py`, adjust config if needed, and save it to the Pico as `main.py`.
 2. Ensure MicroSD card is mounted and accessible
 3. The `main.py` file will automatically execute on boot when powered by battery
 
 ## Configuration
 
-Edit these constants in `sea-movement_recorder.py` before uploading as `main.py`:
-- `RATE_HZ` – Sampling rate (default: 50 Hz for clean, stable logging)
-- `BIAS_SECS` – Still-bias duration (default: 30 s)
-- `BIAS_RATE` – Calibration sample rate (default: 25 Hz)
-- `BLOCK_RECS` – Records per block (default: 1024 → 32 KiB)
-- `I2C_FREQ` – IMU bus frequency (default: 400 kHz)
-- `SPI_BAUD` – SD SPI baudrate (default: 24 MHz after mount)
-- `LED_PIN`, `BTN_PIN` – Hardware pin assignments
+Key knobs (defaults ship-ready):
+- `RATE_HZ = 50`, `BIAS_RATE = 25`, `BIAS_SECS = 30`
+- `BLOCK_RECS = 1024`, `FLUSH_EVERY_N = 4` (bounds SD loss to ≤4 blocks)
+- `SPI_BAUD = 12_000_000` post-mount (1 MHz during mount)
+- `MAX_BUFFERS = 6` in sync mode; bump if you re-enable threading
+- `QA_FLUSH_INTERVAL = 6` (every ~30 s) – safe buffered writes
+- `INT_PIN` can be set to the BNO interrupt pin to allow IRQ pacing (loop waits ≤8 ms)
 
 ## Operation
 
@@ -38,19 +35,19 @@ Edit these constants in `sea-movement_recorder.py` before uploading as `main.py`
 
 **Recording:**
 - LED solid = actively recording
-- Data buffered in 1024-record blocks (~32 KiB)
-- Async writer drains SD queue; periodic GC keeps timing clean
-- Press button again to stop and safely unmount SD card
+- Button press requests graceful stop (flushes final partial block + QA buffer)
+- SD writes are synchronous with retries; `.err` is created if an exception bubbles up
+- `_meta.txt` captures jitter stats, SD throughput, VSYS minima, QA count, reason codes
 
-**Files:**
-- Saved as `bno_XXX.bin` on SD card plus `bno_XXX_meta.txt`
-- v2 header: 42 bytes (magic `BNO2`, version, rate, flags, start epoch, device ID, bias, sample count, CRC32)
-- Per-record payload: 32 bytes – `t_ms`, linear accel (m/s²), quaternion (qi,qj,qk,qr)
-- Companion `bno_XXX_qa.csv` logs periodic raw accel/gyro snapshots + quaternion norm
+**Files written per run:**
+- `bno_###.bin` – binary stream (v2 header + 32 byte records)
+- `bno_###_meta.txt` – textual stats (stop reason, jitter, SD usage, QA info)
+- `bno_###_qa.csv` – periodic QA snapshots (accel, gyro, quaternion norm, VSYS)
+- `bno_###.err` – only when an exception or SD error occurs
 
-## Planned Improvements
+## Next up
 
-- **Add LED error pattern** for SD/IMU init failures.
-- **Optional periodic fsync** (every 30–60 s) to bound worst-case data loss.
-- **Expose IMU temperature** alongside QA snapshots.
-- **Automate PSD-based high-pass selection** once long-run spectra are analysed.
+- LED error pattern for obvious mount failures
+- Optional SD rollover when a write error leaves a dirty tail
+- IMU temperature logging inside QA CSV
+- Configurable reconstruction-friendly downlink (BLE or UART streaming)

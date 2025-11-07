@@ -1,4 +1,8 @@
-from machine import I2C, Pin, SPI, ADC
+try:
+    from machine import I2C, Pin, SPI, ADC, PWM
+except ImportError:
+    from machine import I2C, Pin, SPI, ADC
+    PWM = None
 from utime import ticks_ms, ticks_diff, sleep_ms, ticks_add, time
 from array import array
 from gc import collect as gc_collect
@@ -6,7 +10,7 @@ import gc
 import sys
 import uos, struct, sdcard
 import ubinascii
-from math import sqrt
+from math import sqrt, cos, pi
 from bno08x import *
 
 try:
@@ -85,7 +89,21 @@ def print_battery_status():
     print("=" * 40)
 
 # --- LED / Button (IRQ-latched stop) ---
-led = Pin(LED_PIN, Pin.OUT, value=0)
+S_BOOT, S_READY, S_REC, S_STOP, S_ERR = 0, 1, 2, 3, 4
+
+_led_pin = Pin(LED_PIN, Pin.OUT, value=0)
+if PWM is not None:
+    try:
+        led_pwm = PWM(_led_pin)
+        led_pwm.freq(1000)
+        HAVE_PWM_LED = True
+    except Exception:
+        led_pwm = None
+        HAVE_PWM_LED = False
+else:
+    led_pwm = None
+    HAVE_PWM_LED = False
+
 btn = Pin(BTN_PIN, Pin.IN, Pin.PULL_UP)
 int_pin = Pin(INT_PIN, Pin.IN, Pin.PULL_UP) if INT_PIN is not None else None
 
@@ -105,13 +123,44 @@ if int_pin is not None:
     int_pin.irq(trigger=Pin.IRQ_FALLING, handler=_int_irq)
 
 def blink_pattern(now,state):
-    S_BOOT,S_READY,S_REC,S_STOP,S_ERR=0,1,2,3,4
     if state==S_BOOT:  return (now%1000)<200
     if state==S_READY: p=now%2000; return (0<=p<120) or (240<=p<360)
     if state==S_REC:   return True
     if state==S_STOP:  p=now%1000; return (0<=p<80) or (200<=p<280) or (400<=p<480)
     if state==S_ERR:   return (now%200)<100
     return False
+
+def led_set(state, now_ms=None):
+    if now_ms is None:
+        now_ms = ticks_ms()
+    if not HAVE_PWM_LED:
+        _led_pin.value(1 if blink_pattern(now_ms, state) else 0)
+        return
+    if state == S_REC:
+        period = 2400
+        phase = (now_ms % period) / period
+        amp = (1 - cos(2 * pi * phase)) * 0.5
+        lo, hi = 0.08, 0.80
+        level = lo + (hi - lo) * amp
+        led_pwm.duty_u16(int(level * 65535))
+        return
+    if state == S_BOOT:
+        level = 0.5 if (now_ms % 1000) < 200 else 0.02
+    elif state == S_READY:
+        p = now_ms % 2000
+        level = 0.6 if (0 <= p < 120 or 240 <= p < 360) else 0.02
+    elif state == S_STOP:
+        p = now_ms % 1000
+        level = 0.7 if (0 <= p < 80 or 200 <= p < 280 or 400 <= p < 480) else 0.02
+    else:  # S_ERR or fallback
+        level = 0.85 if (now_ms % 200) < 100 else 0.02
+    led_pwm.duty_u16(int(level * 65535))
+
+def led_off():
+    if HAVE_PWM_LED:
+        led_pwm.duty_u16(0)
+    else:
+        _led_pin.value(0)
 
 # --- Filesystem ---
 def next_name(prefix="bno", ext="bin"):
@@ -189,15 +238,23 @@ def record_session(bias_xyz, fname):
     except Exception:
         qa_file = None
     qa_pending = []
-    def flush_qa_buffer():
+    def flush_qa_buffer(force=False):
         nonlocal qa_pending, qa_file
-        if qa_file and qa_pending:
-            try:
-                qa_file.writelines(qa_pending)
+        if not qa_pending:
+            return
+        if not qa_file:
+            qa_pending.clear()
+            return
+        try:
+            # MicroPython streams lack writelines(), so write line-by-line
+            for line in qa_pending:
+                qa_file.write(line)
+            if force or len(qa_pending) >= QA_FLUSH_INTERVAL:
                 qa_file.flush()
-                qa_pending.clear()
-            except Exception:
-                pass
+        except Exception:
+            pass
+        finally:
+            qa_pending.clear()
     # SD free space snapshot for metadata
     sd_bs = sd_blocks = sd_bfree = sd_bavail = 0
     sd_total_bytes = sd_free_bytes = 0
@@ -534,7 +591,7 @@ def record_session(bias_xyz, fname):
     next_lv_check = ticks_add(t0, LV_CHECK_MS)
 
     print("Recording ->",fname,"| rate =",RATE_HZ,"Hz")
-    led.value(1)
+    led_set(S_REC, ticks_ms())
 
     try:
         # Use combined driver read (bounded/non-alloc in driver) per tick if available
@@ -560,6 +617,7 @@ def record_session(bias_xyz, fname):
                 continue
 
             now = ticks_ms()
+            led_set(S_REC, now)
             if t_first is None:
                 t_first = now
             t_last_s = now
@@ -648,18 +706,14 @@ def record_session(bias_xyz, fname):
                 qa_sample_count += 1
                 if qa_file:
                     line = "%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.3f\n" % (t_ms, ax_q, ay_q, az_q, gx_q, gy_q, gz_q, qnorm, vsys_now)
-                    qa_pending.append(line)
-                    if len(qa_pending) >= QA_FLUSH_INTERVAL:
-                        flush_qa_buffer()
+                qa_pending.append(line)
+                if len(qa_pending) >= QA_FLUSH_INTERVAL:
+                    flush_qa_buffer()
 
             if widx == BLOCK_RECS:
                 blocks += 1
                 flush_flag = bool(FLUSH_EVERY_N) and ((blocks % FLUSH_EVERY_N) == 0)
                 enqueue_block(active_idx, block_bytes, flush_flag)
-                try:
-                    led.toggle()
-                except AttributeError:
-                    led.value(0 if led.value() else 1)
                 next_idx = take_buffer()
                 if next_idx is None:
                     print("Buffer exhaustion; stopping.")
@@ -705,11 +759,11 @@ def record_session(bias_xyz, fname):
             print("Writer cleanup error:", e)
         gc_collect()
         try:
-            f.flush(); led.value(0); sleep_ms(20); led.value(1); f.close()
+            f.flush(); led_off(); sleep_ms(20); led_set(S_REC, ticks_ms()); f.close()
         except Exception:
             pass
         try:
-            flush_qa_buffer()
+            flush_qa_buffer(force=True)
             if qa_file:
                 qa_file.close()
         except Exception:
@@ -828,7 +882,9 @@ def record_session(bias_xyz, fname):
 
 # -------- MAIN --------
 try:
-    for _ in range(2): led.value(1); sleep_ms(60); led.value(0); sleep_ms(60)
+    for _ in range(2):
+        led_set(S_BOOT, ticks_ms()); sleep_ms(60)
+        led_off(); sleep_ms(60)
     print_battery_status()
 
     print("Initializing I2C…")
@@ -843,7 +899,7 @@ try:
     print("Biasing… keep still.")
     t0=ticks_ms()
     while ticks_diff(ticks_ms(),t0)<(BIAS_SECS*1000):
-        led.value(1 if blink_pattern(ticks_ms(),0) else 0); sleep_ms(10)
+        led_set(S_BOOT, ticks_ms()); sleep_ms(10)
     bx,by,bz=still_bias()
     print("Bias ~ bx=%.4f by=%.4f bz=%.4f"%(bx,by,bz))
 
@@ -852,10 +908,10 @@ try:
     sd,spi=mount_sd()
     print("Ready. Press button to START.")
     while btn.value()==1:
-        led.value(1 if blink_pattern(ticks_ms(),1) else 0); sleep_ms(20)
+        led_set(S_READY, ticks_ms()); sleep_ms(20)
     while btn.value()==0: sleep_ms(10)  # release
 
-    led.value(1)
+    led_set(S_REC, ticks_ms())
     fname=next_name()
     record_session((bx,by,bz), fname)
 
@@ -863,11 +919,11 @@ try:
     umount_sd()
     t1=ticks_ms()
     while ticks_diff(ticks_ms(),t1)<800:
-        led.value(1 if blink_pattern(ticks_ms(),3) else 0); sleep_ms(10)
-    led.value(0); print("Done. Safe to power off.")
+        led_set(S_STOP, ticks_ms()); sleep_ms(10)
+    led_off(); print("Done. Safe to power off.")
 
 except Exception as e:
     sys.print_exception(e)
     print("ERROR:",repr(e))
     while True:
-        led.value(1 if blink_pattern(ticks_ms(),4) else 0); sleep_ms(20)
+        led_set(S_ERR, ticks_ms()); sleep_ms(20)
