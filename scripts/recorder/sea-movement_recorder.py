@@ -15,20 +15,37 @@ except ImportError:
     start_new_thread = None
     allocate_lock = None
 
+# Force synchronous writer to isolate issues (disable threading temporarily)
+start_new_thread = None
+
 # -------- CONFIG --------
 RATE_HZ       = 50              # sampling rate (stable target)
 BIAS_RATE     = 25
 BIAS_SECS     = 30
 BLOCK_RECS    = 1024            # 32 KiB blocks (1024 * 32 B)
-FLUSH_EVERY_N = 1               # checkpoint every N full blocks (0 = only at stop)
+FLUSH_EVERY_N = 4               # checkpoint every N full blocks (0 = only at stop)
 I2C_FREQ      = 400_000
-SPI_BAUD      = 24_000_000
+SPI_BAUD      = 12_000_000      # reduced to add margin for flaky media/sockets
 CS_PIN        = 13
 LED_PIN       = 28
 BTN_PIN       = 14
 INT_PIN       = None
 STATUS_MS     = 2000
 # ------------------------
+
+# --- Stop reasons (meta tags) ---
+REASON_NONE     = 0
+REASON_I2C_OS   = 1
+REASON_SD_WRITE = 2
+REASON_OTHER    = 3
+REASON_ENOSPC   = 4  # No space left on device
+
+# --- Robustness knobs ---
+MAX_CONSEC_READ_ERRORS = 100   # ~2.0 s at 50 Hz before controlled stop
+I2C_RETRY_SLEEP_MS     = 2     # brief backoff after transient I2C faults
+MAX_BUFFERS            = 6     # cap on live buffers when running synchronously
+QA_FLUSH_INTERVAL      = 6     # number of QA lines to batch before flushing
+INT_WAIT_TIMEOUT_MS    = 8     # max wait for data-ready IRQ before falling back
 
 DT_MS    = int(1000 // RATE_HZ)
 REC_FMT  = "<Ifffffff"         # t_ms, lx,ly,lz, qi,qj,qk,qr
@@ -42,6 +59,10 @@ HEADER_FLAGS_LINEAR   = 0x01
 HEADER_FLAGS_GAME_RV  = 0x02
 HEADER_FLAGS_COMBINED = 0x04
 DEVICE_ID      = 0x42554F59  # 'BUOY'
+
+# --- SD write resilience ---
+SD_WRITE_RETRIES     = 3
+SD_WRITE_BACKOFF_MS  = 10
 
 QA_SAMPLE_INTERVAL_S   = 5
 QA_SAMPLE_INTERVAL_REC = max(1, int(RATE_HZ * QA_SAMPLE_INTERVAL_S))
@@ -111,6 +132,20 @@ def umount_sd():
     try: uos.umount("/sd")
     except: pass
 
+# Write helper with small, bounded retries on transient SD errors
+def _sd_write_with_retries(fh, mv):
+    for _ in range(SD_WRITE_RETRIES):
+        try:
+            return fh.write(mv)
+        except OSError as e:
+            code = e.args[0] if getattr(e, "args", None) else None
+            if code in (5, 110):  # EIO / ETIMEDOUT
+                sleep_ms(SD_WRITE_BACKOFF_MS)
+                continue
+            raise
+    # last try, let any exception propagate to caller
+    return fh.write(mv)
+
 # --- BNO ---
 i2c = None
 bno = None
@@ -150,9 +185,32 @@ def record_session(bias_xyz, fname):
     qa_file = None
     try:
         qa_file = open(qa_path, "w")
-        qa_file.write("t_ms,ax,ay,az,gx,gy,gz,qnorm\n")
+        qa_file.write("t_ms,ax,ay,az,gx,gy,gz,qnorm,vsys_v\n")
     except Exception:
         qa_file = None
+    qa_pending = []
+    def flush_qa_buffer():
+        nonlocal qa_pending, qa_file
+        if qa_file and qa_pending:
+            try:
+                qa_file.writelines(qa_pending)
+                qa_file.flush()
+                qa_pending.clear()
+            except Exception:
+                pass
+    # SD free space snapshot for metadata
+    sd_bs = sd_blocks = sd_bfree = sd_bavail = 0
+    sd_total_bytes = sd_free_bytes = 0
+    try:
+        vfs = uos.statvfs("/sd")
+        sd_bs = vfs[0] if len(vfs) > 0 and vfs[0] else 512
+        sd_blocks = vfs[2] if len(vfs) > 2 else 0
+        sd_bfree = vfs[3] if len(vfs) > 3 else 0
+        sd_bavail = vfs[4] if len(vfs) > 4 else sd_bfree
+        sd_total_bytes = sd_bs * sd_blocks
+        sd_free_bytes = sd_bs * sd_bavail
+    except Exception:
+        pass
 
     block_bytes = REC_SIZE * BLOCK_RECS
     have_thread = bool(start_new_thread and allocate_lock)
@@ -171,6 +229,66 @@ def record_session(bias_xyz, fname):
     writer_run = have_thread
     writer_done = not have_thread
     writer_error = None
+
+
+    # Recovery helper: try to remount SD and reopen current file in append mode
+    def sd_recover_and_reopen():
+        nonlocal f, fname, writer_error, error_reason, err_info, qa_file, recover_attempted, recover_success, recover_tail_mod
+        # sd/spi live at module scope
+        global sd, spi
+        try:
+            try:
+                f.flush()
+            except Exception:
+                pass
+            try:
+                f.close()
+            except Exception:
+                pass
+            # Close QA file before unmount/remount
+            try:
+                flush_qa_buffer()
+                if qa_file:
+                    qa_file.close()
+            except Exception:
+                pass
+            try:
+                umount_sd()
+            except Exception:
+                pass
+            sleep_ms(200)
+            try:
+                sd, spi = mount_sd()
+            except Exception:
+                pass
+            # Before appending, ensure file tail is record-aligned
+            try:
+                st = uos.stat(fname)
+                tail = (st[6] - HEADER_SIZE) % REC_SIZE
+            except Exception:
+                tail = -1
+            # track recovery context for .err details
+            recover_attempted = 1
+            recover_tail_mod = tail
+            if tail != 0:
+                # Unsafe to append to a dirty tail; bail out cleanly
+                err_info = err_info or ("recover: dirty tail (bytes=%r), abort append" % (tail,))
+                recover_success = 0
+                return False
+            try:
+                f = open(fname, "ab")
+                # Reopen QA CSV in append mode as well
+                try:
+                    qa_file = open(qa_path, "a")
+                except Exception:
+                    qa_file = None
+                recover_success = 1
+                return True
+            except Exception:
+                recover_success = 0
+                return False
+        except Exception:
+            return False
 
     total_write_bytes = 0
     max_write_ms = 0
@@ -191,6 +309,22 @@ def record_session(bias_xyz, fname):
     crc32_accum = 0
     qa_sample_count = 0
     qa_counter = QA_SAMPLE_INTERVAL_REC
+    consec_read_errors = 0
+    max_consec_read_errors = 0
+    error_reason = REASON_NONE
+    err_info = None
+    # Recovery state context for .err diagnostics
+    recover_attempted = 0
+    recover_success = 0
+    recover_tail_mod = -1
+    buf_inflight_max = 0
+
+    def update_buf_inflight():
+        nonlocal buf_inflight_max
+        in_use = len(buffers) - len(free_indices)
+        if in_use > buf_inflight_max:
+            buf_inflight_max = in_use
+    update_buf_inflight()
 
     def release_buffer(idx):
         if have_thread:
@@ -201,6 +335,7 @@ def record_session(bias_xyz, fname):
             free_indices.append(idx)
 
     def take_buffer():
+        global stop_flag
         while True:
             if have_thread:
                 free_lock.acquire()
@@ -214,17 +349,38 @@ def record_session(bias_xyz, fname):
                 sleep_ms(1)
             else:
                 if free_indices:
-                    return free_indices.pop()
+                    idx = free_indices.pop()
+                    update_buf_inflight()
+                    return idx
+                # No free buffers; cap allocations to avoid runaway growth
+                if len(buffers) >= MAX_BUFFERS:
+                    for _ in range(20):
+                        if free_indices or stop_flag:
+                            break
+                        sleep_ms(1)
+                    if free_indices:
+                        idx = free_indices.pop()
+                        update_buf_inflight()
+                        return idx
+                    print("Buffer cap reached; stopping.")
+                    stop_flag = True
+                    return None
                 buf = bytearray(block_bytes)
                 buffers.append(buf)
+                update_buf_inflight()
                 return len(buffers) - 1
 
     def enqueue_block(idx, length, flush_flag):
-        nonlocal q_tail, q_count, q_full_hits, q_high_water, total_write_bytes, max_write_ms
+        nonlocal q_tail, q_count, q_full_hits, q_high_water, total_write_bytes, max_write_ms, checkpoint_count
+        nonlocal writer_error, error_reason, err_info, f
+        global stop_flag
         if length <= 0:
             return
         if writer_error:
-            raise writer_error
+            if not stop_flag:
+                stop_flag = True
+            release_buffer(idx)
+            return
         if have_thread:
             while True:
                 q_lock.acquire()
@@ -241,12 +397,54 @@ def record_session(bias_xyz, fname):
                 q_lock.release()
                 q_full_hits += 1
                 if stop_flag:
+                    release_buffer(idx)
                     return
                 sleep_ms(1)
         else:
             mv = memoryview(buffers[idx])[:length]
             t0w = ticks_ms()
-            f.write(mv)
+            try:
+                _sd_write_with_retries(f, mv)
+            except OSError as err:
+                code = err.args[0] if getattr(err, "args", None) else None
+                if code in (5, 110):
+                    # Attempt a basic recovery: remount SD and reopen current file, then retry once
+                    if sd_recover_and_reopen():
+                        t0w = ticks_ms()
+                        try:
+                            _sd_write_with_retries(f, mv)
+                        except Exception as err2:
+                            writer_error = err2
+                            if error_reason == REASON_NONE:
+                                error_reason = REASON_SD_WRITE
+                            err_info = err_info or "enqueue_block write (after recover): %r" % (err2,)
+                            stop_flag = True
+                            release_buffer(idx)
+                            return
+                    else:
+                        writer_error = err
+                        if error_reason == REASON_NONE:
+                            error_reason = REASON_SD_WRITE
+                        err_info = err_info or "enqueue_block write: %r" % (err,)
+                        stop_flag = True
+                        release_buffer(idx)
+                        return
+                elif code == 28:  # ENOSPC
+                    writer_error = err
+                    if error_reason == REASON_NONE:
+                        error_reason = REASON_ENOSPC
+                    err_info = err_info or "enqueue_block write: ENOSPC"
+                    stop_flag = True
+                    release_buffer(idx)
+                    return
+                else:
+                    writer_error = err
+                    if error_reason == REASON_NONE:
+                        error_reason = REASON_SD_WRITE
+                    err_info = err_info or "enqueue_block write: %r" % (err,)
+                    stop_flag = True
+                    release_buffer(idx)
+                    return
             write_ms = ticks_diff(ticks_ms(), t0w)
             if write_ms > max_write_ms:
                 max_write_ms = write_ms
@@ -259,12 +457,20 @@ def record_session(bias_xyz, fname):
                     except Exception:
                         pass
                     checkpoint_count += 1
-                except Exception:
-                    pass
+                except Exception as err:
+                    writer_error = err
+                    code = err.args[0] if getattr(err, "args", None) else None
+                    if error_reason == REASON_NONE:
+                        error_reason = REASON_ENOSPC if code == 28 else REASON_SD_WRITE
+                    err_info = err_info or ("enqueue_block flush: %s" % ("ENOSPC" if code == 28 else repr(err)))
+                    stop_flag = True
+                    release_buffer(idx)
+                    return
             release_buffer(idx)
 
     def writer_loop():
         nonlocal q_head, q_count, writer_run, writer_done, total_write_bytes, max_write_ms, writer_error, checkpoint_count
+        nonlocal error_reason, err_info, f
         # NOTE: this closure uses the outer 'f'; never rebind 'f' inside.
         try:
             while True:
@@ -281,7 +487,7 @@ def record_session(bias_xyz, fname):
                     buf_idx, length, flush_flag = entry
                     mv = memoryview(buffers[buf_idx])[:length]
                     t0w = ticks_ms()
-                    f.write(mv)
+                    _sd_write_with_retries(f, mv)
                     write_ms = ticks_diff(ticks_ms(), t0w)
                     if write_ms > max_write_ms:
                         max_write_ms = write_ms
@@ -303,6 +509,14 @@ def record_session(bias_xyz, fname):
                 sleep_ms(1)
         except Exception as err:
             writer_error = err
+            code = None
+            try:
+                code = err.args[0] if getattr(err, "args", None) else None
+            except Exception:
+                code = None
+            if error_reason == REASON_NONE:
+                error_reason = REASON_ENOSPC if code == 28 else REASON_SD_WRITE
+            err_info = err_info or ("writer_loop: %s" % ("ENOSPC" if code == 28 else repr(err)))
         finally:
             writer_done = True
 
@@ -330,11 +544,20 @@ def record_session(bias_xyz, fname):
             if stop_flag:
                 print("Stop requested."); break
 
-            if int_pin is not None and data_ready_flag:
-                data_ready_flag = False
+            if int_pin is not None:
+                if not data_ready_flag:
+                    wait_deadline = ticks_add(ticks_ms(), INT_WAIT_TIMEOUT_MS)
+                    while (not data_ready_flag) and (ticks_diff(wait_deadline, ticks_ms()) > 0) and not stop_flag:
+                        sleep_ms(1)
+                if data_ready_flag:
+                    data_ready_flag = False
 
             if writer_error:
-                raise writer_error
+                print("Writer error; stopping safely.")
+                if error_reason == REASON_NONE:
+                    error_reason = REASON_SD_WRITE
+                stop_flag = True
+                continue
 
             now = ticks_ms()
             if t_first is None:
@@ -344,6 +567,7 @@ def record_session(bias_xyz, fname):
 
             # Bounded, resilient reads; reuse last values on transient MemoryError
             read_ok = True
+            last_exception_was_os = False
             try:
                 if combined_read:
                     bno.read_combined_into(acc3, quat4)
@@ -354,11 +578,25 @@ def record_session(bias_xyz, fname):
                     qi, qj, qk, qr = bno.quaternion
             except (MemoryError, RuntimeError):
                 read_ok = False
+            except OSError:
+                read_ok = False
+                last_exception_was_os = True
+                consec_read_errors += 1
+                if consec_read_errors > max_consec_read_errors:
+                    max_consec_read_errors = consec_read_errors
+                sleep_ms(I2C_RETRY_SLEEP_MS)
+            else:
+                consec_read_errors = 0
 
             if not read_ok:
                 missing_slots += 1
                 lx, ly, lz = last_lx, last_ly, last_lz
                 qi, qj, qk, qr = last_qi, last_qj, last_qk, last_qr
+                if last_exception_was_os and consec_read_errors >= MAX_CONSEC_READ_ERRORS:
+                    print("I2C error persisted; stopping safely.")
+                    if error_reason == REASON_NONE:
+                        error_reason = REASON_I2C_OS
+                    stop_flag = True
             else:
                 last_lx, last_ly, last_lz = lx, ly, lz
                 last_qi, last_qj, last_qk, last_qr = qi, qj, qk, qr
@@ -406,13 +644,13 @@ def record_session(bias_xyz, fname):
                 except Exception:
                     gx_q = gy_q = gz_q = 0.0
                 qnorm = sqrt((qi * qi) + (qj * qj) + (qk * qk) + (qr * qr))
+                vsys_now, _ = read_vsys_voltage()
                 qa_sample_count += 1
                 if qa_file:
-                    try:
-                        qa_file.write("%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n" % (t_ms, ax_q, ay_q, az_q, gx_q, gy_q, gz_q, qnorm))
-                        qa_file.flush()
-                    except Exception:
-                        pass
+                    line = "%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.3f\n" % (t_ms, ax_q, ay_q, az_q, gx_q, gy_q, gz_q, qnorm, vsys_now)
+                    qa_pending.append(line)
+                    if len(qa_pending) >= QA_FLUSH_INTERVAL:
+                        flush_qa_buffer()
 
             if widx == BLOCK_RECS:
                 blocks += 1
@@ -438,6 +676,15 @@ def record_session(bias_xyz, fname):
             if (total & 511) == 0:
                 gc_collect()
 
+    except Exception as e:
+        if error_reason == REASON_NONE:
+            error_reason = REASON_OTHER
+        try:
+            err_code = e.args[0] if getattr(e, "args", None) else None
+        except Exception:
+            err_code = None
+        err_info = err_info or "Exception: %r errno=%r" % (e, err_code)
+        stop_flag = True
     finally:
         try:
             if widx:
@@ -445,10 +692,12 @@ def record_session(bias_xyz, fname):
                 enqueue_block(active_idx, widx * REC_SIZE, True)
             if have_thread:
                 writer_run = False
-                while not writer_done:
+                for _ in range(3000):  # ~3 s grace
+                    if writer_done:
+                        break
                     sleep_ms(1)
-                if writer_error:
-                    raise writer_error
+                if not writer_done:
+                    print("Writer thread join timeout.")
             else:
                 # ensure final flush if running synchronously
                 pass
@@ -460,13 +709,49 @@ def record_session(bias_xyz, fname):
         except Exception:
             pass
         try:
-            qa_file.flush(); qa_file.close()
+            flush_qa_buffer()
+            if qa_file:
+                qa_file.close()
         except Exception:
             pass
         if qa_sample_count:
             print("QA samples:", qa_path, "count:", qa_sample_count)
         else:
             print("QA samples: none logged")
+        try:
+            if writer_error is not None or err_info is not None:
+                err_path = fname.replace(".bin", ".err")
+                with open(err_path, "w") as ef:
+                    ef.write("blocks=%d total_write_bytes=%d\n" % (blocks, total_write_bytes))
+                    if writer_error is not None:
+                        ef.write("Writer error (SD path):\n")
+                        try:
+                            sys.print_exception(writer_error, ef)
+                        except Exception:
+                            ef.write(repr(writer_error) + "\n")
+                        code = writer_error.args[0] if getattr(writer_error, "args", None) else None
+                        ef.write("errno=%r\n" % (code,))
+                    if err_info:
+                        ef.write(err_info + "\n")
+                    # Recovery/tail diagnostic context
+                    try:
+                        st_now = uos.stat(fname)
+                        cur_tail = (st_now[6] - HEADER_SIZE) % REC_SIZE
+                    except Exception:
+                        cur_tail = -1
+                    try:
+                        ef.write("recovery_attempted=%d recovery_success=%d recovery_tail_mod=%d current_tail_mod=%d\n" % (
+                            recover_attempted, recover_success, recover_tail_mod, cur_tail))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        recs_from_size = 0
+        try:
+            st = uos.stat(fname)
+            recs_from_size = max(0, (st[6] - HEADER_SIZE) // REC_SIZE)
+        except Exception:
+            pass
         try:
             header_values[-2] = total & 0xFFFFFFFF
             header_values[-1] = crc32_accum & 0xFFFFFFFF
@@ -499,9 +784,39 @@ def record_session(bias_xyz, fname):
                     mf.write("Missed slots (DT_MS=%d ms): %d\n" % (DT_MS, missing_slots))
                     mf.write("Queue high-water: %d\n" % q_high_water)
                     mf.write("Queue full hits: %d\n" % q_full_hits)
+                    mf.write("Buffer in-flight max: %d\n" % buf_inflight_max)
                     mf.write("Writer max write ms: %d\n" % max_write_ms)
                     mf.write("Writer total bytes: %d\n" % total_write_bytes)
                     mf.write("Checkpoints (flush+sync): %d\n" % checkpoint_count)
+                    mf.write("SD block size: %d\n" % sd_bs)
+                    mf.write("SD total blocks: %d\n" % sd_blocks)
+                    mf.write("SD free blocks (start): %d\n" % sd_bfree)
+                    mf.write("SD avail blocks (start): %d\n" % sd_bavail)
+                    mf.write("SD total bytes: %d\n" % sd_total_bytes)
+                    mf.write("SD free bytes (start): %d\n" % sd_free_bytes)
+                    # Capture end-of-session SD space as well
+                    try:
+                        vfs_end = uos.statvfs("/sd")
+                        sd_end_bfree = vfs_end[3] if len(vfs_end) > 3 else 0
+                        sd_end_bavail = vfs_end[4] if len(vfs_end) > 4 else sd_end_bfree
+                        sd_end_free_bytes = sd_bs * sd_end_bavail
+                        mf.write("SD free blocks (end): %d\n" % sd_end_bfree)
+                        mf.write("SD avail blocks (end): %d\n" % sd_end_bavail)
+                        mf.write("SD free bytes (end): %d\n" % sd_end_free_bytes)
+                    except Exception:
+                        pass
+                    reason_text = {
+                        REASON_NONE: "none",
+                        REASON_I2C_OS: "I2C_OSError",
+                        REASON_SD_WRITE: "SD_write_error",
+                        REASON_ENOSPC: "ENOSPC",
+                        REASON_OTHER: "other",
+                    }.get(error_reason, "other")
+                    mf.write("Stop reason: %d (%s)\n" % (error_reason, reason_text))
+                    mf.write("Max consecutive read errors: %d\n" % max_consec_read_errors)
+                    mf.write("Samples by file size (may include partial last record): %d\n" % recs_from_size)
+                    if total and recs_from_size and (recs_from_size != total):
+                        mf.write("Header vs size mismatch: header=%d size=%d\n" % (total, recs_from_size))
                     mf.write("Low voltage stop: %d (thresh=%.2f V, min_vsys=%.2f V)\n" % (low_voltage_stop, LV_THRESH, min_vsys))
                     mf.write("QA sample count: %d (every %d samples)\n" % (qa_sample_count, QA_SAMPLE_INTERVAL_REC))
                     if qa_sample_count:

@@ -5,7 +5,7 @@ import os
 import struct
 import sys
 import binascii
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 HEADER_V1_MAGIC = 0x424E4F31  # 'BNO1'
 HEADER_V1_FMT = "<IBHB"
@@ -71,6 +71,18 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         "--psd-plot",
         metavar="OUT.png",
         help="Plot the acceleration PSD (requires numpy and matplotlib).",
+    )
+    parser.add_argument(
+        "--reconstruct-csv",
+        metavar="OUT.csv",
+        help="Write 10 Hz displacement stream (timestamp_s,surge_m,sway_m,heave_m). Requires numpy.",
+    )
+    parser.add_argument(
+        "--wave-metrics",
+        metavar="OUT.csv",
+        nargs="?",
+        const="",
+        help="Compute Hs/Tp from heave acceleration; optionally write results to CSV. Requires numpy and SciPy.",
     )
     parser.add_argument(
         "--verify-crc",
@@ -263,6 +275,28 @@ def write_plots(path: str, records: List[Tuple]) -> None:
     print(f"Wrote plot: {path}")
 
 
+def write_reconstruction_csv(path: str, t_s, x, y, z) -> None:
+    with open(path, "w", newline="") as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(["timestamp_s", "surge_m", "sway_m", "heave_m"])
+        for row in zip(t_s, x, y, z):
+            writer.writerow([float(row[0]), float(row[1]), float(row[2]), float(row[3])])
+    print(f"Wrote reconstruction CSV: {path}")
+
+
+def write_wave_metrics_csv(path: str, hs: Optional[float], tp: Optional[float]) -> None:
+    with open(path, "w", newline="") as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(["Hs_m", "Tp_s"])
+        writer.writerow(
+            [
+                "" if hs is None else f"{hs:.6f}",
+                "" if tp is None else f"{tp:.6f}",
+            ]
+        )
+    print(f"Wrote wave metrics CSV: {path}")
+
+
 def _median(values: List[float]) -> float:
     vs = sorted(values)
     n = len(vs)
@@ -424,6 +458,67 @@ def main(argv: Sequence[str]) -> int:
         return 1
 
     show_summary(header, records, args.head)
+
+    recon_requested = bool(args.reconstruct_csv) or args.wave_metrics is not None
+    if recon_requested:
+        if not records:
+            print("No samples available for reconstruction; skipping.", file=sys.stderr)
+        else:
+            try:
+                import numpy as np  # type: ignore
+            except ImportError as exc:  # pragma: no cover - optional dependency
+                print(
+                    "Motion reconstruction requires numpy. Install it with 'pip install numpy'.",
+                    file=sys.stderr,
+                )
+                return 1
+            try:
+                from reconstruct import reconstruct_motion, wave_metrics_from_az  # type: ignore
+            except ImportError as exc:  # pragma: no cover - module packaging
+                print(f"Reconstruction helpers not found: {exc}", file=sys.stderr)
+                return 1
+            fs_native = float(header.get("rate_hz") or 0.0)
+            if fs_native <= 0.0:
+                print("Header missing a valid sampling rate; cannot reconstruct motion.", file=sys.stderr)
+                return 1
+            arr = np.asarray(records, dtype=np.float64)
+            t_ms = arr[:, 0]
+            lx = arr[:, 1]
+            ly = arr[:, 2]
+            lz = arr[:, 3]
+            qi = arr[:, 4]
+            qj = arr[:, 5]
+            qk = arr[:, 6]
+            qr = arr[:, 7]
+            try:
+                motion = reconstruct_motion(t_ms, lx, ly, lz, qi, qj, qk, qr, fs=fs_native, out_fs=10.0)
+            except Exception as exc:
+                print(f"Motion reconstruction failed: {exc}", file=sys.stderr)
+                return 1
+            if args.reconstruct_csv:
+                if motion["t10"].size == 0:
+                    print("Motion reconstruction produced no samples to write.", file=sys.stderr)
+                else:
+                    write_reconstruction_csv(
+                        args.reconstruct_csv, motion["t10"], motion["x10"], motion["y10"], motion["z10"]
+                    )
+            if args.wave_metrics is not None:
+                try:
+                    hs, tp = wave_metrics_from_az(motion["az_band"], motion["fs_in"])
+                except Exception as exc:
+                    print(f"Wave metric computation failed: {exc}", file=sys.stderr)
+                else:
+                    if hs is None and tp is None:
+                        print(
+                            "Wave metrics unavailable (requires scipy.signal.welch).",
+                            file=sys.stderr,
+                        )
+                    else:
+                        tp_display = "n/a" if tp is None else f"{tp:.3f}"
+                        hs_display = "n/a" if hs is None else f"{hs:.3f}"
+                        print(f"Wave metrics: Hs={hs_display} m, Tp={tp_display} s")
+                        if args.wave_metrics:
+                            write_wave_metrics_csv(args.wave_metrics, hs, tp)
 
     effective_rate = header["rate_hz"]
 
