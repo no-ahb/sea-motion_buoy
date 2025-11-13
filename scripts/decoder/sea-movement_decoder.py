@@ -63,6 +63,18 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         help="Apply first-order high-pass filter at this cutoff frequency (Hz). 0 = disabled.",
     )
     parser.add_argument(
+        "--recon-highpass",
+        type=float,
+        default=0.05,
+        help="High-pass cutoff (Hz) for reconstruction band-limit (default: 0.05).",
+    )
+    parser.add_argument(
+        "--recon-lowpass",
+        type=float,
+        default=3.5,
+        help="Low-pass cutoff (Hz) for reconstruction band-limit (default: 3.5).",
+    )
+    parser.add_argument(
         "--psd",
         metavar="OUT.csv",
         help="Write acceleration PSD to CSV (requires numpy).",
@@ -83,6 +95,29 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         nargs="?",
         const="",
         help="Compute Hs/Tp from heave acceleration; optionally write results to CSV. Requires numpy and SciPy.",
+    )
+    parser.add_argument(
+        "--reconstruct-freq-csv",
+        metavar="OUT.csv",
+        help="Write frequency-domain reconstructed displacement to CSV.",
+    )
+    parser.add_argument(
+        "--recon-freq-highpass",
+        type=float,
+        default=0.01,
+        help="Frequency-domain recon high-pass cutoff (Hz, default 0.01).",
+    )
+    parser.add_argument(
+        "--recon-freq-lowpass",
+        type=float,
+        default=1.5,
+        help="Frequency-domain recon low-pass cutoff (Hz, default 1.5).",
+    )
+    parser.add_argument(
+        "--recon-freq-detrend",
+        type=float,
+        default=600.0,
+        help="Frequency-domain recon sliding detrend window (seconds, default 600).",
     )
     parser.add_argument(
         "--verify-crc",
@@ -459,7 +494,7 @@ def main(argv: Sequence[str]) -> int:
 
     show_summary(header, records, args.head)
 
-    recon_requested = bool(args.reconstruct_csv) or args.wave_metrics is not None
+    recon_requested = bool(args.reconstruct_csv) or bool(args.reconstruct_freq_csv) or args.wave_metrics is not None
     if recon_requested:
         if not records:
             print("No samples available for reconstruction; skipping.", file=sys.stderr)
@@ -473,7 +508,7 @@ def main(argv: Sequence[str]) -> int:
                 )
                 return 1
             try:
-                from reconstruct import reconstruct_motion, wave_metrics_from_az  # type: ignore
+                from reconstruct import reconstruct_motion, reconstruct_motion_freq, wave_metrics_from_az  # type: ignore
             except ImportError as exc:  # pragma: no cover - module packaging
                 print(f"Reconstruction helpers not found: {exc}", file=sys.stderr)
                 return 1
@@ -491,7 +526,20 @@ def main(argv: Sequence[str]) -> int:
             qk = arr[:, 6]
             qr = arr[:, 7]
             try:
-                motion = reconstruct_motion(t_ms, lx, ly, lz, qi, qj, qk, qr, fs=fs_native, out_fs=10.0)
+                motion = reconstruct_motion(
+                    t_ms,
+                    lx,
+                    ly,
+                    lz,
+                    qi,
+                    qj,
+                    qk,
+                    qr,
+                    fs=fs_native,
+                    out_fs=10.0,
+                    hp=args.recon_highpass,
+                    lp=args.recon_lowpass,
+                )
             except Exception as exc:
                 print(f"Motion reconstruction failed: {exc}", file=sys.stderr)
                 return 1
@@ -519,6 +567,36 @@ def main(argv: Sequence[str]) -> int:
                         print(f"Wave metrics: Hs={hs_display} m, Tp={tp_display} s")
                         if args.wave_metrics:
                             write_wave_metrics_csv(args.wave_metrics, hs, tp)
+            if args.reconstruct_freq_csv:
+                try:
+                    motion_freq = reconstruct_motion_freq(
+                        t_ms,
+                        lx,
+                        ly,
+                        lz,
+                        qi,
+                        qj,
+                        qk,
+                        qr,
+                        fs=fs_native,
+                        out_fs=10.0,
+                        hp=args.recon_freq_highpass,
+                        lp=args.recon_freq_lowpass,
+                        detrend_window=args.recon_freq_detrend,
+                    )
+                except Exception as exc:
+                    print(f"Frequency-domain reconstruction failed: {exc}", file=sys.stderr)
+                    return 1
+                if motion_freq["t10"].size == 0:
+                    print("Frequency-domain reconstruction produced no samples to write.", file=sys.stderr)
+                else:
+                    write_reconstruction_csv(
+                        args.reconstruct_freq_csv,
+                        motion_freq["t10"],
+                        motion_freq["x10"],
+                        motion_freq["y10"],
+                        motion_freq["z10"],
+                    )
 
     effective_rate = header["rate_hz"]
 

@@ -82,7 +82,7 @@ See `MATERIALS.md` for the complete bill of materials.
 - Raspberry Pi Pico 2 + ProtoMate carrier
 - BNO085 breakout wired to I2C(0) @ 400 kHz
 - SD breakout on SPI(1) (mount @ 1 MHz → 12 MHz runtime)
-- LiPo SHIM + 2000 mAh cell (≈8 h at 50 Hz; proven 7 h run)
+- LiPo SHIM + 2000 mAh cell (now proven **25 h** continuous logging: VSYS 4.28 → 3.94 V over `2025-11-12:13_session_02`, so 24 h deployments are supported with margin)
 - Waterproof hull + button/LED pass-throughs (see docs/)
 
 ## Development Workflow
@@ -97,6 +97,6 @@ See `MATERIALS.md` for the complete bill of materials.
 **Current Phase:** First shippable logger/decoder bundle
 - ✅ Recorder v0.1: synchronous writer, SD retries, QA buffering, INT pacing hook
 - ✅ Decoder v0.2: CSV/plot/PSD/reconstruction pipeline + wave metrics hook
-- ✅ Field validation: 7 h run `bno_008` (no errors)
+- ✅ Field validation: 7 h run `bno_008` (no errors) **and** 25 h run `2025-11-12:13_session_02` (battery margin confirms ≥24 h deployments)
 - 🔄 Hardware polish: better SD cards, waterproof packaging
 - 🔜 Motor playback integration using reconstructed CSVs

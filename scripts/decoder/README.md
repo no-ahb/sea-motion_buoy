@@ -1,6 +1,6 @@
 # Decoder Scripts
 
-Python 3 tooling for turning recorder `.bin` files into human-readable CSV, QA plots, PSDs and 10 Hz reconstructed displacement streams. `sea-movement_decoder.py` now mirrors the workflow used on the 7 h `bno_008` run (CSV + PSD plot + motion reconstruction).
+Python 3 tooling for turning recorder `.bin` files into human-readable CSV, QA plots, PSDs and 10 Hz reconstructed displacement streams. 
 
 ## Usage
 
@@ -15,6 +15,17 @@ python3 scripts/decoder/sea-movement_decoder.py \
   recordings/test/006_1107\ err\ \ overnight/bno_008.bin \
   --csv bno_008_decoded.csv --reconstruct-csv bno_008_motion_10hz.csv \
   --wave-metrics bno_008_waves.csv --downsample 10 --robust trimmed --highpass 0.05
+
+# 3) Motor-ready feed (crop + normalize + fade)
+RUN_DIR="recordings/test/007_30min sea test"
+python3 scripts/decoder/sea-movement_decoder.py \
+  "$RUN_DIR/bno_000.bin" \
+  --reconstruct-csv "$RUN_DIR/bno_000_motion_10hz.csv"
+
+python3 scripts/decoder/motor_feed.py \
+  "$RUN_DIR/bno_000_motion_10hz.csv" \
+  --output-csv "$RUN_DIR/bno_000_motor_norm_fade10s.csv" \
+  --output-plot "$RUN_DIR/bno_000_motor_norm_fade10s.png"
 ```
 
 ### Key Options
@@ -27,6 +38,14 @@ python3 scripts/decoder/sea-movement_decoder.py \
 - `--reconstruct-csv` – run the NumPy/SciPy pipeline from `reconstruct.py` to produce 10 Hz surge/sway/heave
 - `--wave-metrics` – use Welch spectrum on heave to estimate Hs/Tp (SciPy optional)
 - `--verify-crc` – recompute CRC32 over the binary payload
+- `scripts/decoder/motor_feed.py` – helper to crop out pier transients, normalize surge/sway/heave jointly to 0–1, and apply fade-in/out envelopes (10 s default) before driving motors. Key flags:
+  - `--percentile`, `--deploy-window`, `--retrieve-window`, `--margin` tune automatic cropping.
+  - `--crop-window-sec`/`--crop-std-threshold` detect the longest in-water interval via rolling std, with `--crop-prepad-sec`/`--crop-postpad-sec` to keep some context.
+  - `--fade-seconds` controls the soft-start length.
+  - `--hampel-k/--hampel-t` remove narrow mechanical spikes via Hampel filtering (defaults 9 samples / 3σ).
+  - `--smooth-samples` applies a small moving average (default 11 samples) after Hampel to soften edges.
+  - `--max-step` enforces a slew-rate limit per 10 Hz sample (default 0.02 normalized units).
+  - `--global-min`, `--global-max` let you lock consistent normalization across multiple days.
 
 ## Output
 
